@@ -473,12 +473,6 @@ static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readba
     }
 }
 
-static float ReadPpGammaOverride();
-static float ReadPpExposureOverride();
-static int ReadPpTonemapMode();
-static bool ReadPpAutoExposureEnabled();
-static bool ReadPpBypassEnabled();
-
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
@@ -509,30 +503,6 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
-    pp_gamma_override = ReadPpGammaOverride();
-    if (pp_gamma_override > 0.0f) {
-        pp_settings.gamma = pp_gamma_override;
-    }
-    pp_exposure_override = ReadPpExposureOverride();
-    if (pp_exposure_override > 0.0f) {
-        pp_settings.exposure = pp_exposure_override;
-    }
-    pp_tonemap_mode_override = ReadPpTonemapMode();
-    if (pp_tonemap_mode_override >= 0) {
-        pp_settings.tonemap_mode = static_cast<u32>(pp_tonemap_mode_override);
-    }
-    pp_auto_exposure_enabled = ReadPpAutoExposureEnabled();
-    pp_bypass_enabled = ReadPpBypassEnabled();
-    if (pp_bypass_enabled) {
-        pp_settings.bypass = 1u;
-    }
-    // Auto-exposure buffer seed: when auto is off we pin it to 1.0 so the
-    // shader's `pp.exposure * autoexp.smoothed_exposure` boils down to just
-    // `pp.exposure` (the manual env-var path). When auto is on, the compute
-    // pass overwrites it every frame; the seed of 1.0 here is still used on
-    // the frame before the first auto dispatch.
-    auto_exposure_pass.Create(device, instance.GetAllocator(), 1.0f);
-
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
 }
 
@@ -545,8 +515,6 @@ Presenter::~Presenter() {
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
-
-    auto_exposure_pass.Destroy();
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -706,86 +674,10 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     static std::unordered_set<u32> seen;
     const u32 key = static_cast<u32>(format);
     if (seen.insert(key).second) {
-        LOG_INFO(Render_Vulkan, "[gamma-dbg] Video-out PixelFormat {} -> vk::Format {}",
+        LOG_INFO(Render_Vulkan, "Video-out PixelFormat {} -> vk::Format {}",
                  key, vk::to_string(out));
     }
     return out;
-}
-
-static float ReadFloatEnvOverride(const char* name, float lo, float hi) {
-    const char* env = std::getenv(name);
-    if (!env || !*env) {
-        return -1.0f;
-    }
-    try {
-        const float v = std::stof(env);
-        if (v >= lo && v <= hi) {
-            LOG_INFO(Render_Vulkan, "[gamma-dbg] {}={} accepted", name, v);
-            return v;
-        }
-        LOG_WARNING(Render_Vulkan, "[gamma-dbg] {}={} out of [{}, {}], ignoring", name, env, lo,
-                    hi);
-    } catch (...) {
-        LOG_WARNING(Render_Vulkan, "[gamma-dbg] {}={} not a float, ignoring", name, env);
-    }
-    return -1.0f;
-}
-
-static float ReadPpGammaOverride() {
-    // Widened below the PS4 sceVideoOutAdjustColor spec of 0.1..2.0. The
-    // lower end 0.01 pushes the sRGB encode exponent toward 1/3.4, about
-    // the most aggressive brightening this curve can produce.
-    return ReadFloatEnvOverride("SHADPS4_PP_GAMMA_OVERRIDE", 0.01f, 2.0f);
-}
-
-static float ReadPpExposureOverride() {
-    return ReadFloatEnvOverride("SHADPS4_PP_EXPOSURE", 0.1f, 10.0f);
-}
-
-static int ReadPpTonemapMode() {
-    const char* env = std::getenv("SHADPS4_PP_TONEMAP");
-    if (!env || !*env) {
-        return -1;
-    }
-    if (std::string_view{env} == "luma" || std::string_view{env} == "1") {
-        LOG_INFO(Render_Vulkan, "[gamma-dbg] SHADPS4_PP_TONEMAP=luma (luma-preserving ACES)");
-        return 1;
-    }
-    if (std::string_view{env} == "perchannel" || std::string_view{env} == "0") {
-        LOG_INFO(Render_Vulkan, "[gamma-dbg] SHADPS4_PP_TONEMAP=perchannel (per-channel ACES)");
-        return 0;
-    }
-    LOG_WARNING(Render_Vulkan, "[gamma-dbg] SHADPS4_PP_TONEMAP={} unknown, use 0/perchannel or 1/luma",
-                env);
-    return -1;
-}
-
-static bool ReadPpAutoExposureEnabled() {
-    const char* env = std::getenv("SHADPS4_PP_AUTO_EXPOSURE");
-    if (!env || !*env) {
-        return false;
-    }
-    const std::string_view v{env};
-    if (v == "1" || v == "true" || v == "on" || v == "yes") {
-        LOG_INFO(Render_Vulkan, "[gamma-dbg] SHADPS4_PP_AUTO_EXPOSURE enabled");
-        return true;
-    }
-    return false;
-}
-
-static bool ReadPpBypassEnabled() {
-    const char* env = std::getenv("SHADPS4_PP_BYPASS");
-    if (!env || !*env) {
-        return false;
-    }
-    const std::string_view v{env};
-    if (v == "1" || v == "true" || v == "on" || v == "yes") {
-        LOG_INFO(Render_Vulkan,
-                 "[gamma-dbg] SHADPS4_PP_BYPASS enabled — post-process shader will output raw "
-                 "sRGB-encoded input");
-        return true;
-    }
-    return false;
 }
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
@@ -857,44 +749,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
-    // Overrides win over game-set brightness (sceVideoOutAdjustColor) and devtools slider.
-    if (pp_gamma_override > 0.0f) {
-        pp_settings.gamma = pp_gamma_override;
-    }
-    if (pp_exposure_override > 0.0f) {
-        pp_settings.exposure = pp_exposure_override;
-    }
-    if (pp_tonemap_mode_override >= 0) {
-        pp_settings.tonemap_mode = static_cast<u32>(pp_tonemap_mode_override);
-    }
-    if (pp_auto_exposure_enabled) {
-        auto_exposure_pass.Render(cmdbuf, image_view, image_size, auto_exposure_settings);
-
-        // Periodic state log so we can see what auto-exposure is actually
-        // computing without attaching a GPU debugger. The buffer is
-        // host-mapped, so this is cheap.
-        static u32 s_log_counter = 0;
-        if ((++s_log_counter % 60u) == 0u) {
-            float cur_exposure = -1.0f;
-            float cur_scene_luma = -1.0f;
-            float cur_peak_luma = -1.0f;
-            u32 cur_frame = 0u;
-            auto_exposure_pass.ReadCurrentState(cur_exposure, cur_scene_luma, cur_frame,
-                                                cur_peak_luma);
-            LOG_INFO(Render_Vulkan,
-                     "[gamma-dbg] auto-exposure: scene_luma={:.5f} peak_luma={:.5f} "
-                     "smoothed_exposure={:.3f} frames={}",
-                     cur_scene_luma, cur_peak_luma, cur_exposure, cur_frame);
-        }
-    } else if (!pp_auto_exposure_initialized) {
-        // Pin the auto-exposure buffer to 1.0 so the shader's
-        // `pp.exposure * autoexp.smoothed_exposure` collapses to just
-        // `pp.exposure`. Only needs to happen once per session.
-        auto_exposure_pass.WriteManualExposure(cmdbuf, 1.0f);
-        pp_auto_exposure_initialized = true;
-    }
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings,
-                   auto_exposure_pass.GetExposureBuffer());
+    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
