@@ -385,8 +385,11 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
 
 s32 PS4_SYSV_ABI sceVideoOutColorSettingsSetGamma(SceVideoOutColorSettings* settings, float gamma) {
     if (gamma < 0.1f || gamma > 2.0f) {
+        LOG_WARNING(Lib_VideoOut, "sceVideoOutColorSettingsSetGamma: gamma={} out of [0.1, 2.0]",
+                    gamma);
         return ORBIS_VIDEO_OUT_ERROR_INVALID_VALUE;
     }
+    LOG_INFO(Lib_VideoOut, "sceVideoOutColorSettingsSetGamma: gamma={}", gamma);
     settings->gamma = gamma;
     return ORBIS_OK;
 }
@@ -401,6 +404,7 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    LOG_INFO(Lib_VideoOut, "sceVideoOutAdjustColor: handle={} gamma={}", handle, settings->gamma);
     presenter->GetPPSettingsRef().gamma = settings->gamma;
     return ORBIS_OK;
 }
