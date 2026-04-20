@@ -134,6 +134,9 @@ private:
     std::condition_variable_any frame_cv;
     std::optional<ImGui::RefCountedTexture> splash_img;
     std::vector<VAddr> vo_buffers_addr;
+    float pp_gamma_override{-1.0f};    // SHADPS4_PP_GAMMA_OVERRIDE, <0 means unset
+    float pp_exposure_override{-1.0f}; // SHADPS4_PP_EXPOSURE, <0 means unset
+    int pp_tonemap_mode_override{-1};  // SHADPS4_PP_TONEMAP (0|1), <0 means unset
 };
 
 } // namespace Vulkan
