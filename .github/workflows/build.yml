@@ -486,3 +486,55 @@ jobs:
             echo "Skipping pre-release: $release_id (newer or same date)"
           fi
         done
+
+  fork-release:
+    if: startsWith(github.ref, 'refs/tags/akita-') && github.repository == 'akitaonrails/shadPS4'
+    needs: [get-info, windows-sdl, macos-sdl, linux-sdl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v8
+      with:
+        path: ./artifacts
+
+    - name: Make artifacts executable
+      run: |
+        chmod -R a+x ./artifacts/shadps4-linux-sdl-* 2>/dev/null || true
+        chmod -R a+x ./artifacts/shadps4-macos-sdl-* 2>/dev/null || true
+        chmod -R a+x ./artifacts/shadps4-ubuntu64-* 2>/dev/null || true
+
+    - name: Zip artifact directories
+      run: |
+        cd ./artifacts
+        for dir in */; do
+          if [ -d "$dir" ]; then
+            dir_name=${dir%/}
+            (cd "$dir_name" && zip -r "../${dir_name}.zip" .)
+          fi
+        done
+
+    - name: Publish release on fork
+      uses: ncipollo/release-action@v1
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        tag: ${{ github.ref_name }}
+        name: "shadPS4 ${{ github.ref_name }} (akitaonrails fork)"
+        prerelease: true
+        allowUpdates: true
+        body: |
+          Unofficial build from my `gamma-debug` fork of shadPS4.
+
+          Commit: [${{ needs.get-info.outputs.fullhash }}](https://github.com/akitaonrails/shadPS4/commit/${{ needs.get-info.outputs.fullhash }})
+
+          What's in this fork vs upstream nightly — see
+          [`docs/driveclub-v128-investigation.md`](https://github.com/akitaonrails/shadPS4/blob/gamma-debug/docs/driveclub-v128-investigation.md)
+          and
+          [`docs/driveclub-session-2026-04-20.md`](https://github.com/akitaonrails/shadPS4/blob/gamma-debug/docs/driveclub-session-2026-04-20.md).
+
+          **Assets**
+          - `shadps4-win64-sdl-*.zip` — Windows, unzip and run `shadPS4.exe`.
+          - `shadps4-linux-sdl-*.zip` — Linux AppImage (`Shadps4-sdl.AppImage`).
+          - `shadps4-macos-sdl-*.zip` — macOS x86_64, includes bundled MoltenVK.
+        artifacts: ./artifacts/*.zip
