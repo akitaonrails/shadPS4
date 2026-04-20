@@ -75,6 +75,11 @@ void Swapchain::Create(u32 width_, u32 height_) {
                vk::to_string(swapchain_result));
     swapchain = chain;
 
+    LOG_INFO(Render_Vulkan,
+             "[gamma-dbg] Swapchain created: format={} colorSpace={} supports_hdr={} needs_hdr={}",
+             vk::to_string(format.format), vk::to_string(format.colorSpace), supports_hdr,
+             needs_hdr);
+
     SetupImages();
     RefreshSemaphores();
 }

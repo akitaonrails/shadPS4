@@ -27,9 +27,11 @@
 #include <chrono>
 #include <cmath>
 #include <csetjmp>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <unordered_set>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -471,6 +473,10 @@ static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readba
     }
 }
 
+static float ReadPpGammaOverride();
+static float ReadPpExposureOverride();
+static int ReadPpTonemapMode();
+
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
@@ -500,6 +506,19 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+
+    pp_gamma_override = ReadPpGammaOverride();
+    if (pp_gamma_override > 0.0f) {
+        pp_settings.gamma = pp_gamma_override;
+    }
+    pp_exposure_override = ReadPpExposureOverride();
+    if (pp_exposure_override > 0.0f) {
+        pp_settings.exposure = pp_exposure_override;
+    }
+    pp_tonemap_mode_override = ReadPpTonemapMode();
+    if (pp_tonemap_mode_override >= 0) {
+        pp_settings.tonemap_mode = static_cast<u32>(pp_tonemap_mode_override);
+    }
 
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
 }
@@ -650,20 +669,80 @@ Frame* Presenter::PrepareLastFrame() {
 }
 
 static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat format) {
+    vk::Format out{};
     switch (format) {
     case Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb:
-        return vk::Format::eR8G8B8A8Srgb;
+        out = vk::Format::eR8G8B8A8Srgb;
+        break;
     case Libraries::VideoOut::PixelFormat::A8R8G8B8Srgb:
-        return vk::Format::eB8G8R8A8Srgb;
+        out = vk::Format::eB8G8R8A8Srgb;
+        break;
     case Libraries::VideoOut::PixelFormat::A2R10G10B10:
     case Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb:
     case Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq:
-        return vk::Format::eA2R10G10B10UnormPack32;
-    default:
+        out = vk::Format::eA2R10G10B10UnormPack32;
         break;
+    default:
+        UNREACHABLE_MSG("Unknown format={}", static_cast<u32>(format));
+        return {};
     }
-    UNREACHABLE_MSG("Unknown format={}", static_cast<u32>(format));
-    return {};
+    // Log each distinct guest-format → host-format mapping once per run so the
+    // user can confirm what Driveclub (or any other game) is asking for.
+    static std::unordered_set<u32> seen;
+    const u32 key = static_cast<u32>(format);
+    if (seen.insert(key).second) {
+        LOG_INFO(Render_Vulkan, "[gamma-dbg] Video-out PixelFormat {} -> vk::Format {}",
+                 key, vk::to_string(out));
+    }
+    return out;
+}
+
+static float ReadFloatEnvOverride(const char* name, float lo, float hi) {
+    const char* env = std::getenv(name);
+    if (!env || !*env) {
+        return -1.0f;
+    }
+    try {
+        const float v = std::stof(env);
+        if (v >= lo && v <= hi) {
+            LOG_INFO(Render_Vulkan, "[gamma-dbg] {}={} accepted", name, v);
+            return v;
+        }
+        LOG_WARNING(Render_Vulkan, "[gamma-dbg] {}={} out of [{}, {}], ignoring", name, env, lo,
+                    hi);
+    } catch (...) {
+        LOG_WARNING(Render_Vulkan, "[gamma-dbg] {}={} not a float, ignoring", name, env);
+    }
+    return -1.0f;
+}
+
+static float ReadPpGammaOverride() {
+    // Widened below the PS4 sceVideoOutAdjustColor spec of 0.1..2.0. The
+    // lower end 0.01 pushes the sRGB encode exponent toward 1/3.4, about
+    // the most aggressive brightening this curve can produce.
+    return ReadFloatEnvOverride("SHADPS4_PP_GAMMA_OVERRIDE", 0.01f, 2.0f);
+}
+
+static float ReadPpExposureOverride() {
+    return ReadFloatEnvOverride("SHADPS4_PP_EXPOSURE", 0.1f, 10.0f);
+}
+
+static int ReadPpTonemapMode() {
+    const char* env = std::getenv("SHADPS4_PP_TONEMAP");
+    if (!env || !*env) {
+        return -1;
+    }
+    if (std::string_view{env} == "luma" || std::string_view{env} == "1") {
+        LOG_INFO(Render_Vulkan, "[gamma-dbg] SHADPS4_PP_TONEMAP=luma (luma-preserving ACES)");
+        return 1;
+    }
+    if (std::string_view{env} == "perchannel" || std::string_view{env} == "0") {
+        LOG_INFO(Render_Vulkan, "[gamma-dbg] SHADPS4_PP_TONEMAP=perchannel (per-channel ACES)");
+        return 0;
+    }
+    LOG_WARNING(Render_Vulkan, "[gamma-dbg] SHADPS4_PP_TONEMAP={} unknown, use 0/perchannel or 1/luma",
+                env);
+    return -1;
 }
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
@@ -735,6 +814,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
+    // Overrides win over game-set brightness (sceVideoOutAdjustColor) and devtools slider.
+    if (pp_gamma_override > 0.0f) {
+        pp_settings.gamma = pp_gamma_override;
+    }
+    if (pp_exposure_override > 0.0f) {
+        pp_settings.exposure = pp_exposure_override;
+    }
+    if (pp_tonemap_mode_override >= 0) {
+        pp_settings.tonemap_mode = static_cast<u32>(pp_tonemap_mode_override);
+    }
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
 
     DebugState.game_resolution = {image_size.width, image_size.height};

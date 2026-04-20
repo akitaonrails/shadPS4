@@ -16,7 +16,9 @@ class PostProcessingPass {
 public:
     struct Settings {
         float gamma = 1.0f;
+        float exposure = 1.0f;
         u32 hdr = 0;
+        u32 tonemap_mode = 0; // 0 = per-channel ACES, 1 = luma-preserving ACES
     };
 
     void Create(vk::Device device, vk::Format surface_format);
