@@ -1,0 +1,107 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+// Computes arithmetic-mean luminance of the game's video-out image and
+// updates a smoothed exposure value the SDR post-process shader reads
+// back through a storage buffer. Runs one dispatch per frame with a
+// single 16x16 workgroup; each thread samples a 4x4 tile, giving 4096
+// samples across the centre 70% of the frame.
+//
+// Why arithmetic mean (over geometric): HDR-intent scenes frequently
+// have ~90%+ pixels at values <= 0.001 linear. Geometric mean of those
+// pins at any floor we use, even when bright content is present; the
+// auto-exposure then chases infinity and maxes out. Arithmetic mean
+// responds to bright pixels (tail lights, UI) and produces a usable
+// exposure for the visible content even when most pixels are dim.
+//
+// Outlier clipping at 0.95: prevents a handful of saturated HUD whites
+// from dominating the mean and under-exposing the scene they overlay.
+
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D src_image;
+
+layout(binding = 1) buffer AutoExp {
+    float smoothed_exposure;
+    float last_scene_luma;
+    uint  frame_count;
+    float last_peak_luma;
+} buf;
+
+layout(push_constant) uniform PC {
+    float target_luma;     // e.g. 0.18 (linear mid-grey)
+    float adaptation_rate; // per-dispatch exponential smoothing factor (0..1)
+    float min_exposure;
+    float max_exposure;
+} pc;
+
+#define THREAD_TILE 4        // 4x4 samples per thread → 4096 total
+#define OUTLIER_CLAMP 0.95   // samples above this are treated as 0.95 for the mean
+
+shared float workgroup_luma[256];
+shared float workgroup_peak[256];
+
+void main() {
+    const uvec2 lid = gl_LocalInvocationID.xy;
+    const uint flat_lid = lid.y * 16u + lid.x;
+
+    // Centre 70% of frame. HUD lives in the outer margins; centre-crop
+    // removes it from the sample set even before outlier clipping kicks
+    // in — two defenses because HUD elements can have any colour, not
+    // just near-white.
+    const vec2 crop_lo = vec2(0.15);
+    const vec2 crop_hi = vec2(0.85);
+
+    float sum_luma = 0.0;
+    float peak_luma = 0.0;
+    for (int sy = 0; sy < THREAD_TILE; ++sy) {
+        for (int sx = 0; sx < THREAD_TILE; ++sx) {
+            const vec2 grid = vec2(lid) * float(THREAD_TILE) + vec2(float(sx), float(sy)) + 0.5;
+            const vec2 uv = mix(crop_lo, crop_hi, grid / vec2(16.0 * float(THREAD_TILE)));
+            const vec3 color = textureLod(src_image, uv, 0.0).rgb;
+            const float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+            sum_luma += min(luma, OUTLIER_CLAMP);
+            peak_luma = max(peak_luma, luma);
+        }
+    }
+    workgroup_luma[flat_lid] = sum_luma;
+    workgroup_peak[flat_lid] = peak_luma;
+    barrier();
+
+    // Parallel sum + max across the 256 threads. Each thread already
+    // reduced its THREAD_TILE×THREAD_TILE tile locally above.
+    for (uint offset = 128u; offset > 0u; offset >>= 1u) {
+        if (flat_lid < offset) {
+            workgroup_luma[flat_lid] += workgroup_luma[flat_lid + offset];
+            workgroup_peak[flat_lid] = max(workgroup_peak[flat_lid],
+                                            workgroup_peak[flat_lid + offset]);
+        }
+        barrier();
+    }
+
+    if (flat_lid == 0u) {
+        const float total_samples = 256.0 * float(THREAD_TILE * THREAD_TILE);
+        const float scene_luma = workgroup_luma[0] / total_samples;
+        const float total_peak = workgroup_peak[0];
+        // Very small floor avoids div-by-zero on truly black frames.
+        const float target_exposure =
+            clamp(pc.target_luma / max(scene_luma, 1e-5),
+                  pc.min_exposure, pc.max_exposure);
+
+        float current = buf.smoothed_exposure;
+        // Bootstrap: snap to target on the first frame so we don't fade
+        // in from whatever the CPU seeded into the buffer.
+        if (buf.frame_count == 0u) {
+            current = target_exposure;
+        } else {
+            current = mix(current, target_exposure, pc.adaptation_rate);
+        }
+
+        buf.smoothed_exposure = current;
+        buf.last_scene_luma = scene_luma;
+        buf.last_peak_luma = total_peak;
+        buf.frame_count = buf.frame_count + 1u;
+    }
+}

@@ -476,6 +476,8 @@ static void SavePendingScreenshots(const std::vector<ScreenshotReadback>& readba
 static float ReadPpGammaOverride();
 static float ReadPpExposureOverride();
 static int ReadPpTonemapMode();
+static bool ReadPpAutoExposureEnabled();
+static bool ReadPpBypassEnabled();
 
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
@@ -519,6 +521,17 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     if (pp_tonemap_mode_override >= 0) {
         pp_settings.tonemap_mode = static_cast<u32>(pp_tonemap_mode_override);
     }
+    pp_auto_exposure_enabled = ReadPpAutoExposureEnabled();
+    pp_bypass_enabled = ReadPpBypassEnabled();
+    if (pp_bypass_enabled) {
+        pp_settings.bypass = 1u;
+    }
+    // Auto-exposure buffer seed: when auto is off we pin it to 1.0 so the
+    // shader's `pp.exposure * autoexp.smoothed_exposure` boils down to just
+    // `pp.exposure` (the manual env-var path). When auto is on, the compute
+    // pass overwrites it every frame; the seed of 1.0 here is still used on
+    // the frame before the first auto dispatch.
+    auto_exposure_pass.Create(device, instance.GetAllocator(), 1.0f);
 
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
 }
@@ -532,6 +545,8 @@ Presenter::~Presenter() {
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
+
+    auto_exposure_pass.Destroy();
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -745,6 +760,34 @@ static int ReadPpTonemapMode() {
     return -1;
 }
 
+static bool ReadPpAutoExposureEnabled() {
+    const char* env = std::getenv("SHADPS4_PP_AUTO_EXPOSURE");
+    if (!env || !*env) {
+        return false;
+    }
+    const std::string_view v{env};
+    if (v == "1" || v == "true" || v == "on" || v == "yes") {
+        LOG_INFO(Render_Vulkan, "[gamma-dbg] SHADPS4_PP_AUTO_EXPOSURE enabled");
+        return true;
+    }
+    return false;
+}
+
+static bool ReadPpBypassEnabled() {
+    const char* env = std::getenv("SHADPS4_PP_BYPASS");
+    if (!env || !*env) {
+        return false;
+    }
+    const std::string_view v{env};
+    if (v == "1" || v == "true" || v == "on" || v == "yes") {
+        LOG_INFO(Render_Vulkan,
+                 "[gamma-dbg] SHADPS4_PP_BYPASS enabled — post-process shader will output raw "
+                 "sRGB-encoded input");
+        return true;
+    }
+    return false;
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
@@ -824,7 +867,34 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     if (pp_tonemap_mode_override >= 0) {
         pp_settings.tonemap_mode = static_cast<u32>(pp_tonemap_mode_override);
     }
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    if (pp_auto_exposure_enabled) {
+        auto_exposure_pass.Render(cmdbuf, image_view, image_size, auto_exposure_settings);
+
+        // Periodic state log so we can see what auto-exposure is actually
+        // computing without attaching a GPU debugger. The buffer is
+        // host-mapped, so this is cheap.
+        static u32 s_log_counter = 0;
+        if ((++s_log_counter % 60u) == 0u) {
+            float cur_exposure = -1.0f;
+            float cur_scene_luma = -1.0f;
+            float cur_peak_luma = -1.0f;
+            u32 cur_frame = 0u;
+            auto_exposure_pass.ReadCurrentState(cur_exposure, cur_scene_luma, cur_frame,
+                                                cur_peak_luma);
+            LOG_INFO(Render_Vulkan,
+                     "[gamma-dbg] auto-exposure: scene_luma={:.5f} peak_luma={:.5f} "
+                     "smoothed_exposure={:.3f} frames={}",
+                     cur_scene_luma, cur_peak_luma, cur_exposure, cur_frame);
+        }
+    } else if (!pp_auto_exposure_initialized) {
+        // Pin the auto-exposure buffer to 1.0 so the shader's
+        // `pp.exposure * autoexp.smoothed_exposure` collapses to just
+        // `pp.exposure`. Only needs to happen once per session.
+        auto_exposure_pass.WriteManualExposure(cmdbuf, 1.0f);
+        pp_auto_exposure_initialized = true;
+    }
+    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings,
+                   auto_exposure_pass.GetExposureBuffer());
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
