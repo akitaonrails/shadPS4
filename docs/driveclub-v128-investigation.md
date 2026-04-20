@@ -281,23 +281,55 @@ So the right reading of the whole saga is:
     HDR amplification. A diagnostic bypass tells you which without
     having to guess.
 
-### Final configuration in `gamma-debug`
+### Why the rabbit hole went on so long
 
-Wrapper defaults applied by the QtLauncher version entry:
+The wrong initial premise drove the whole chain. "The image looks dim"
+looked like a tonemap problem, so I reached for tonemap tools. But
+Driveclub's race-start dim pocket is a **game-side fade-in VFX** (the
+cinematic reveal lasts about 5-10 seconds before the game itself
+transitions to full-brightness output), and everything I was watching
+during it — dim menus becoming bright, dim scene becoming colourful —
+looked indistinguishable from an auto-exposure adapting. It wasn't
+auto-exposure; it was the game's own scripted fade.
 
-```
-SHADPS4_PP_BYPASS=1          # shader does sRGB-encode only
-SHADPS4_PP_AUTO_EXPOSURE=0   # compute dispatch skipped
-SHADPS4_PP_EXPOSURE=1.0      # neutral (only takes effect if bypass=0)
-SHADPS4_PP_TONEMAP=luma      # also gated by bypass
-# SHADPS4_PP_GAMMA_OVERRIDE unset — shader uses standard sRGB
-```
+Once I had the `SHADPS4_PP_BYPASS=1` diagnostic path, two frames of
+observation showed raw game output was fine everywhere *except* the
+fade, and the fade was unreachable from post-process math (you can't
+multiply zero into visibility). The whole tonemap toolkit had been
+solving the wrong problem.
 
-The auto-exposure compute pass, ACES shaders, dither pattern, and the
-manual gamma/exposure/tonemap push-constants all stay in the codebase
-as opt-in features. Default behaviour at the shader level remains
-canonical SDR: `linear × 1.0 → ACES → sRGB → dither` if bypass is off;
-with the wrapper having bypass on, that whole chain is skipped.
+The post-mortem lesson: **when "the image looks wrong" is the bug, the
+first diagnostic should be a bypass path that shows raw game output.**
+If bypass looks right, the emulator post-process is actively mangling
+the signal; keep your hands off the tonemap and look elsewhere. If
+bypass also looks wrong, then you're compensating for something real.
+Driveclub fell into the first category. We added bypass near the end
+of the session, after re-deriving the same answer with a dozen
+different tonemap tweaks — it should have been the first test.
+
+### Final configuration after cleanup
+
+The gamma-debug wrapper is now down to just SDL HIDAPI env vars. The
+shader does **standard sRGB encode plus Bayer dither** — no exposure
+multiplier, no ACES, no auto-exposure, no bypass flag (there's nothing
+to bypass since the only thing left is a standard sRGB encode). The
+auto-exposure compute pass, ACES shaders, and exposure/tonemap push
+constants were all removed in a cleanup commit. The Bayer dither
+survived because it's a universal win on 8-bit swapchains, costs
+nothing, and is independent of any tonemap decision.
+
+What remains from this investigation, useful and kept:
+
+  - `src/video_core/host_shaders/post_process.frag` — standard sRGB
+    encode + 4x4 Bayer dither.
+  - `src/video_core/host_shaders/ms_depth_to_color.frag` — MSAA depth
+    resolve (Phase 4 fix).
+  - Diagnostic LOG_INFO in `vk_swapchain::Create` and `GetFrameViewFormat`
+    — cheap one-shot logs that surface useful facts about the render
+    path without needing a GPU debugger.
+  - Shape-logging warning in `ResolveDepthOverlap::else` — catches
+    future unhandled combinations without flooding the log.
+  - Pipeline cache config enable.
 
 ### Upstream candidates
 
