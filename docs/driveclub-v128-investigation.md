@@ -1,0 +1,492 @@
+<!--
+SPDX-FileCopyrightText: 2026 Fabio Akita
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
+# Driveclub on shadPS4: v1.28 + gamma investigation
+
+Branch-local progress log. Lives on `gamma-debug`. Not destined for upstream as-is;
+trimmed/split excerpts may eventually feed upstream PRs (see "Upstream candidates"
+at the end).
+
+Sibling deploy notes in `~/Projects/distrobox-gaming/docs/driveclub-shadps4.md`
+are still the operational runbook for the gaming distrobox. This doc only captures
+what changed while working on this branch.
+
+## Target
+
+- **Game**: DRIVECLUB™, CUSA00003, stock v1.28 disc image, no premium DLC.
+- **Host**: Arch Linux, Clang 22.1.3, CMake 4.3, Vulkan 1.4.341, SDL3 3.4.4.
+- **GPU**: NVIDIA RTX 5090, driver 595.58.3.0, Wayland/Hyprland.
+- **CPU**: Ryzen 9 7950X3D.
+- **Runtime**: gaming distrobox, `~/.local/share/shadPS4/` as the data root,
+  QtLauncher as the shell. Upstream nightly `main-2026-04-19` was the baseline.
+
+## Fork layout
+
+- **`akitaonrails/shadPS4`** (this repo) — `origin`, fork of `shadps4-emu/shadPS4`.
+  Remotes: `origin` = my fork (push), `upstream` = canonical (read-only).
+  `main` tracks `upstream/main` so `git pull` on `main` is always a fast-forward.
+  Branch-local experiments live on feature branches such as `gamma-debug`.
+- **`akitaonrails/DriveClubFS`** (`~/Projects/DriveClubFS`) — fork of
+  `Nenkai/DriveClubFS`. Upstream went dormant after tag `1.1.0` (June 2025) with
+  only README churn since; my fork is the de-facto maintained copy. No code
+  changes applied yet — see v1.28 section below for why the "1.28 crashes" claim
+  from the distrobox docs did not reproduce.
+
+## Verified build recipe
+
+```sh
+git submodule update --init --recursive --jobs 8
+CMAKE_POLICY_VERSION_MINIMUM=3.5 cmake -S . -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build --parallel "$(nproc)"
+```
+
+`CMAKE_POLICY_VERSION_MINIMUM=3.5` is mandatory on this host — CMake 4.3 dropped
+compatibility with pre-3.5 `cmake_minimum_required`, and a few submodules
+(miniz, etc.) still declare older minimums.
+
+Output: `build/shadps4`, ~44 MB, PIE ELF, clang 22.
+
+## Phase 1 — shader compile stalls
+
+### Symptom
+
+Driveclub menus animated at crawl speed on first entry, then snapped to fast
+once past that moment. Pattern repeats on next cold launch.
+
+### Root cause
+
+shadPS4's persistent pipeline cache was not enabled by default. A single session
+compiled ~527 shaders + ~354 pipelines from scratch; every new UI pipeline
+stalled the GPU comm thread during its first use. Nothing cached to disk meant
+the same cost every launch.
+
+### Fix (config-only, no code)
+
+Set `Vulkan.pipeline_cache_enabled = true` in
+`~/.local/share/shadPS4/config.json`. Left `pipeline_cache_archived` at `false`
+(zip-compressed cache) — we want fast load over small disk footprint.
+
+First launch after enabling still has to compile everything. Second launch
+onwards replays the cached pipelines and menus should be snappy.
+
+Backup of the original config preserved as
+`config.json.bak-before-pipeline-cache` next to the live file.
+
+## Phase 2 — gamma / dim image (in flight)
+
+Main complaint: Driveclub renders fine mechanically but the image is markedly
+dim compared to any reference footage. HUD looks correct, scene looks
+desaturated and crushed. The distrobox docs had already ruled out display-side
+fixes (vkBasalt unstable on RTX 5090 + Vulkan 1.4, Hyprland `screen_shader`
+has its own pitfalls, nvidia-settings Digital Vibrance is X11-only).
+
+### Code landscape
+
+The SDR present pipeline lives in `src/video_core/renderer_vulkan/`:
+
+- `vk_swapchain.cpp` picks the swapchain format. Non-HDR path uses
+  `R8G8B8A8Unorm` / `B8G8R8A8Unorm` in `SrgbNonlinear` colorspace — **driver
+  does not auto-encode**, the shader is responsible for the sRGB OETF.
+- `host_passes/pp_pass.*` runs `host_shaders/post_process.frag` on the
+  video-out image before present. The fragment shader applies a piecewise
+  sRGB-shaped encode via a `pp.gamma` push-constant and a `pp.hdr` flag.
+- `vk_presenter.cpp::GetFrameViewFormat` (line ~652) maps guest pixel formats
+  to Vulkan formats. Both `A2R10G10B10` and `A2R10G10B10Bt2020Pq` fall through
+  to `eA2R10G10B10UnormPack32` — the PQ/HDR variant gets silently collapsed to
+  linear Unorm, which I suspect is half the problem.
+- `videoout::sceVideoOutAdjustColor` writes the game's requested gamma into
+  `presenter.pp_settings.gamma`. Driveclub doesn't call this (it expects HDR
+  via its PS4 tonemap instead), so the post-process is running at
+  `gamma = 1.0` over whatever the game wrote.
+
+### Upstream history reviewed
+
+PRs worth knowing about:
+
+- `#2381` (Feb 2025) — original HDR path: `A2B10G10R10Unorm` swapchain in
+  `Hdr10St2084EXT` colorspace when `allowHDR` + game declares HDR.
+- `#2485` / `#2619` — HDR settings UI plumbing.
+- `#3690` (Oct 2025) — moved HDR swapchain reconfig onto the present thread
+  (crash fix).
+- `#1559` (Nov 2024) — "respect game brightness settings", eliminated an old
+  sRGB hack. Suspected in `#1725` (Bloodborne too bright regression).
+- `#1756` (Dec 2024) — reworked the gamma encode curve into the current
+  piecewise function.
+- `#1805` (Dec 2024, closed unmerged) — proposed a Graphics-tab gamma slider.
+- `#3420` (Aug 2025) — per-shader degamma when sampler sets `force_degamma`.
+- `#4087` (Feb 2026, open) — feature request for full/limited-range black
+  level, exactly the symptom shape.
+
+There is no open or merged fix specifically for Driveclub-style "SDR tonemap
+makes scene dim". I'm currently treating this as a gap to fill.
+
+### Branch changes (`gamma-debug`)
+
+Minimal instrumentation, guarded by an env var so the binary is safe to ship
+side-by-side with the nightly:
+
+- `src/video_core/renderer_vulkan/vk_presenter.cpp`
+  - `GetFrameViewFormat` logs each distinct guest `PixelFormat → vk::Format`
+    mapping once per run (`[gamma-dbg]` tag).
+  - Adds `ReadPpGammaOverride()` which reads `SHADPS4_PP_GAMMA_OVERRIDE`
+    (valid range 0.1..2.0). Value is cached on `Presenter` as
+    `pp_gamma_override`; when set, it's re-applied in `PrepareFrame` just
+    before `pp_pass.Render(...)` so it wins over the game's own
+    `sceVideoOutAdjustColor` and the devtools slider.
+- `src/video_core/renderer_vulkan/vk_presenter.h`
+  - New `pp_gamma_override` member on `Presenter` (default `-1.0f` = unset).
+- `src/video_core/renderer_vulkan/vk_swapchain.cpp`
+  - `Create()` now logs chosen format, colorspace, `supports_hdr`,
+    `needs_hdr` at `Info` level.
+
+### Deploy harness
+
+`/mnt/data/distrobox/gaming/bin/shadps4-driveclub-gamma-debug` — isolated
+wrapper. Sets `HOME=/mnt/data/distrobox/gaming/.local/share/shadPS4-gamma-dbg/`
+so the binary writes into a completely separate data tree, seeds the
+per-game JSON on first run, exports SDL HIDAPI env vars for controller
+detection, and launches `CUSA00003/eboot.bin` directly. The production
+QtLauncher path is untouched. Edit the `SHADPS4_PP_GAMMA_OVERRIDE` line at
+the top to tune.
+
+There is also now a **Manager-visible version entry** at
+`~/.local/share/shadPS4QtLauncher/versions/gamma-debug-2026-04-20/` with a
+`Shadps4-sdl.AppImage` shell wrapper that sets the same env vars (SDL
+HIDAPI + `SHADPS4_PP_GAMMA_OVERRIDE=0.7` by default) and `exec`s the
+instrumented binary (`Shadps4-sdl.real`). Registered in `versions.json` as
+"Gamma Debug (local)". It runs against the **same HOME** as the nightly —
+same v1.28 install, same per-game config, same shader cache — so switching
+in the Manager's version dropdown is a true A/B. The standalone isolated
+wrapper at `/mnt/data/distrobox/gaming/bin/shadps4-driveclub-gamma-debug`
+still exists for fully-sandboxed testing if we ever need it.
+
+### Findings from a live Driveclub run
+
+Captured via the gamma-debug Manager entry on 2026-04-20:
+
+```
+[gamma-dbg] Swapchain created: format=B8G8R8A8Unorm colorSpace=SrgbNonlinear
+            supports_hdr=false needs_hdr=false
+[gamma-dbg] Video-out PixelFormat 0x80000000 -> vk::Format B8G8R8A8Srgb
+```
+
+So Driveclub on v1.28 uses plain 8-bit sRGB (`A8R8G8B8Srgb`), not the 10-bit
+HDR-capable format I had been worrying about. The HDR-PQ fallthrough in
+`GetFrameViewFormat` isn't relevant here (would matter for other titles —
+keep that fix in our back pocket).
+
+The dimness is therefore **not** a format-mismatch bug. The game is just
+writing low-luminance values to an 8-bit sRGB target; hardware sRGB
+decode on sample returns faithful linear values; the SDR re-encode is
+mathematically correct; and the resulting output is simply dim because
+the game's internal tonemap was tuned for HDR display brightness.
+
+### Fix shape in this branch
+
+Replaced the identity sRGB encode at the SDR present path with a
+three-knob pipeline, all driven by push-constants (no per-frame CPU
+cost). Source lives in `src/video_core/host_shaders/post_process.frag`
+and plumbed through `pp_pass.h::Settings` / `vk_presenter.cpp`:
+
+```
+exposed    = linear_color * pp.exposure              // brighten
+tonemapped = aces_per_channel(exposed)               // 0 = default, compat
+           | aces_luma_preserving(exposed)           // 1 = preserve hue
+final      = gamma_encode(tonemapped)                // existing sRGB curve
+```
+
+- **Exposure** (`pp.exposure`, default `1.0f`): pure linear multiplier.
+  Rescues under-bright scenes. Values up to 10x are safe because ACES
+  rolls off the top.
+- **Tone-map mode** (`pp.tonemap_mode`, default `0`):
+  - `0` = per-channel ACES (Narkowicz approximation). Simple, standard,
+    slightly desaturating at the shoulder.
+  - `1` = luma-preserving ACES. Tone-maps `dot(rgb, rec709_luma)` and
+    scales chroma proportionally, so hue is preserved even under heavy
+    exposure boost. Fixes the "bright but grey" look per-channel ACES
+    can produce.
+- **Gamma** (`pp.gamma`, default `1.0f`): existing sRGB-shape curve,
+  clamp widened on my branch to `0.01..2.0` (spec is `0.1..2.0`).
+
+Driver env vars on the debug wrapper:
+`SHADPS4_PP_GAMMA_OVERRIDE`, `SHADPS4_PP_EXPOSURE`, `SHADPS4_PP_TONEMAP`
+(`perchannel`/`0` or `luma`/`1`). Applied at `Presenter` construction and
+re-asserted each frame before `pp_pass.Render` so they win over
+`sceVideoOutAdjustColor` and the devtools slider.
+
+### What worked for Driveclub
+
+Final working combination confirmed in-game on 2026-04-20:
+
+```
+SHADPS4_PP_GAMMA_OVERRIDE=0.7
+SHADPS4_PP_EXPOSURE=3.0
+SHADPS4_PP_TONEMAP=luma
+```
+
+Scene content (track, cars, sky, trees) lifted from near-black to
+correctly-readable brightness with preserved color. Highlights in the
+game's pause menu saturate slightly but are acceptable for now — the
+ACES shoulder keeps them from pure white, which the earlier hard-clamp
+variant could not.
+
+### Status
+
+**Resolved for Driveclub** with the three env-var knobs. Follow-up work
+before this can be upstreamed:
+
+1. Expose the three knobs as per-game JSON fields (`Gpu.pp_gamma`,
+   `Gpu.pp_exposure`, `Gpu.pp_tonemap`), with env vars kept as a debug
+   escape hatch.
+2. Drop the `[gamma-dbg]` tags from `LOG_INFO` strings before a PR (the
+   `Swapchain created` and `Video-out PixelFormat` logs are useful
+   enough to upstream on their own merits).
+3. Consider whether `tonemap_mode=1` (luma-preserving) should be the
+   default. It's clearly the "right" math for under-bright SDR source,
+   but changing the default changes output for every game — needs an
+   A/B on more titles first.
+
+## Phase 3 — v1.28 content access
+
+### Myth busted
+
+The distrobox docs (`docs/driveclub-shadps4.md`) said
+`DriveClubFS 1.1.0 crashes at file 12/8018 with EndOfStreamException` on a
+v1.28-merged tree. That claim does **not** reproduce against current data.
+
+What I actually found:
+
+1. **Upstream DriveClubFS has no 1.28 fix and none in flight.**
+   Master is 4 commits ahead of tag `1.1.0`, all README-only. Zero PRs ever
+   opened. One closed issue (`#1` "DriveClub VR", Nov 2025) describes the
+   same `EndOfStreamException` shape but was closed without any engagement.
+2. **Only other fork** (`illusionyy/DriveClubFS`, 2023) is 0 ahead / 7 behind
+   upstream — a stale snapshot, no divergent code.
+3. **Running DriveClubFS unpack-all on a properly-merged v1.28 tree succeeded
+   cleanly** — 8018/8018 files extracted, 47 GB, exit 0, zero errors or
+   skips. Either the earlier attempt was run against a badly-staged tree, or
+   the crash was transient and has since been resolved silently.
+
+No fork patch needed for 1.28. The fork at `~/Projects/DriveClubFS` still
+exists for future stewardship but there's nothing to apply today.
+
+### Working v1.28 install recipe
+
+Paths below are on the gaming distrobox host mount. Commands prefixed
+`distrobox enter gaming -- ...` where the NAS mount differs from the sandbox.
+
+```sh
+# Starting point: CUSA00003/ is a working v1.00 install (DriveClubFS-unpacked)
+# Goal: swap in v1.28 content, preserve v1.00 as backup.
+
+cd /mnt/terachad/Emulators/EmuDeck/roms_rare/ps4
+
+# 1. Extract v1.28 PKG to a staging dir. ~19 GB PKG, ~20 GB output.
+#    Contains eboot.bin (v1.28), game.ndx (v1.28, 419K), ~41 high-index .dat
+#    files, sce_module (libc.prx + libSceFios2.prx), sce_companion_httpd,
+#    .prx/.plt resources, and a partial sce_sys/about/.
+/mnt/data/distrobox/gaming/tools/ShadPKG/build-cli/shadpkg extract \
+    -i /mnt/terachad/.../Driveclub.v1.28.PATCH.REPACK.PS4-GCMR.pkg \
+    -o /mnt/terachad/.../CUSA00003-v128-test
+
+# 2. Symlink the v1.00 .dat files into the v1.28 tree so DriveClubFS sees
+#    the full set (the v1.28 index references both low- and high-numbered
+#    .dat files).
+cd CUSA00003-v128-test
+for f in ../CUSA00003/game*.dat; do ln -s "$f" "$(basename "$f")"; done
+
+# 3. Run DriveClubFS. v1.28 index reports 8018 entries; output ~47 GB loose.
+dotnet ~/Projects/DriveClubFS/DriveClubFS/bin/Release/net10.0/DriveClubFS.dll \
+    unpack-all \
+    -i /mnt/terachad/.../CUSA00003-v128-test \
+    -o /mnt/terachad/.../CUSA00003-v128-test-out \
+    --skip-verifying-checksum
+
+# 4. Swap in place, backup preserved.
+cd /mnt/terachad/Emulators/EmuDeck/roms_rare/ps4
+mv CUSA00003 CUSA00003.v100-working-backup   # keep as rollback
+mkdir CUSA00003
+mv CUSA00003-v128-test-out/* CUSA00003/       # 8018 loose files (47 GB)
+rmdir CUSA00003-v128-test-out
+
+# 5. Copy v1.28 metadata on top (not the .dat files — loose files win).
+cd CUSA00003-v128-test
+for f in eboot.bin game.ndx *.prx *.plt; do
+  [ -e "$f" ] && cp -a "$f" ../CUSA00003/
+done
+for d in sce_sys sce_module sce_companion_httpd; do
+  [ -d "$d" ] && cp -a "$d" ../CUSA00003/
+done
+
+# 6. CRITICAL: restore base sce_sys files from v1.00 backup (see below).
+cd ../CUSA00003/sce_sys
+for f in param.sfo disc_info.dat keystone; do
+  [ ! -f "$f" ] && cp -a "../../CUSA00003.v100-working-backup/sce_sys/$f" .
+done
+
+# 7. Re-enable the 60 fps patch (its offsets target v1.28 eboot).
+mv ~/.local/share/shadPS4/patches/Driveclub.xml.disabled-for-v1.0 \
+   ~/.local/share/shadPS4/patches/Driveclub.xml
+```
+
+Keep `CUSA00003-v128-test/` around — it's the re-runnable DriveClubFS
+input if the loose-file tree ever needs regeneration. Leave
+`CUSA00003.v100-working-backup/` in place for one-command rollback.
+
+### The `sce_sys/param.sfo` gotcha
+
+v1.28 is a **CUMULATIVE_PATCH** PKG. ShadPKG's extraction of that PKG gives
+you `sce_sys/about/right.sprx` and not much else — base metadata (param.sfo,
+disc_info.dat, keystone) is NOT re-shipped by cumulative patches because a
+real PS4 already has them from the base install.
+
+On our side the only copy of those files lives in the v1.00 backup tree. If
+you naively `cp -a` the v1.28 `sce_sys/` over the new install, you end up
+with a folder that has `about/right.sprx` but no `param.sfo` at all. shadPS4
+loads the eboot, applies the Driveclub.xml patch, boots the game, but the
+game's internal "am I running v1.28? what content is unlocked?" checks silently
+fall back to "not yet released → download required" because there's no APP_VER
+to compare against. Hence "all content locked, asking to download", even
+though the v1.28 eboot is the one actually running.
+
+The v1.00 backup's `param.sfo` is fine to restore as-is: it already has both
+`APP_VER = 01.28` and `VERSION = 01.00` (the base VERSION stays at 01.00
+forever, APP_VER reflects whatever patch is installed on top).
+
+`npbind.dat` is absent in both our v1.00 backup and the v1.28 patch output.
+That's only needed for premium DLC entitlement verification; base game and
+free-update content don't require it.
+
+### After the fix
+
+With the restored `param.sfo` the user confirmed in-game that:
+- Previously greyed-out / "download required" content is now accessible.
+- New v1.28 content is visible in menus.
+
+Remaining concerns carried into next phase:
+
+- **Slowness during gameplay** — see Phase 4.
+- **Dim image** — unchanged by the v1.28 swap, still owned by Phase 2.
+
+## Priority note
+
+**2026-04-20, later:** Phase 2 (gamma) is resolved with the ACES +
+luma-preserving tonemap. Phase 4 (slowness) is now the active line of
+investigation — Driveclub under v1.28 is playable but feels like molasses,
+and the `ResolveDepthOverlap: Unimplemented depth overlap copy` spam is
+the most plausible cause.
+
+## Phase 4 — post-v1.28 slowness (deferred)
+
+### Evidence
+
+First post-swap session ran ~16 minutes. Log at
+`~/.local/share/shadPS4/log/shad_log.txt` shows:
+
+- **Pipeline cache enabled** ✓. This session compiled 864 shaders + 590
+  pipelines — up from ~881 for v1.00. The extra ~330 shader modules are
+  v1.28-specific content (new tracks, livery assets, etc.). Because the
+  pipeline cache was empty on first run with v1.28, all of these were
+  compiled fresh. `Cache dumped` on shutdown confirms the cache was
+  persisted, so this cost is one-shot.
+- **1325 occurrences** of
+  `texture_cache.cpp:276 ResolveDepthOverlap: Unimplemented depth overlap copy`
+  in the log, clustered entirely in the in-game portion (first occurrence at
+  line 15587, heaviest density 400+ per 1000-line band after that). This is
+  the actual slowness signal — **not** a resource shortage on the RTX 5090
+  or the 7950X3D.
+
+### Why it's slow
+
+The warning comes from `TextureCache::ResolveOverlap` in
+`src/video_core/texture_cache/texture_cache.cpp` around line 276. When the
+cache has an image at an address but the incoming binding has a different
+sample-count / depth semantic than the two supported fast paths
+(`new → color + multi-sample`, or `1-sample depth → MSAA depth expansion`),
+the code falls into an `else` that just `FreeImage`s the cached image,
+logs the warning, and returns the new image with **no data copy**.
+
+Every hit causes:
+
+- A Vulkan image free (driver state churn on NVIDIA).
+- A new allocation the next time the address is bound.
+- Broken read-after-write for whatever pipeline expected the cached contents.
+
+At hundreds of hits per frame the sheer allocator overhead is enough to
+explain the subjective slowdown. Separately, any rendering pass that
+expected the cached depth contents is getting undefined data — which might
+also be feeding the dim-image symptom through broken post-process input.
+
+### Relevant upstream work
+
+- `#3667` "Handle mixed samples attachments (V2)" — merged.
+- `#3205` "texture_cache: Change depth resolve new image back to max of
+  resources." — merged.
+
+Both are already in our build. The `else` branch that logs
+`Unimplemented depth overlap copy` remains the catch-all, so there's real
+code to add there, not just a config tweak.
+
+### 60 fps patch not ruled out yet
+
+The `Driveclub.xml` 60fps patch is active. It modifies the eboot's fixed
+tickrate (log: `Applied patch: 60 FPS with fixed tickrate, Offset:
+34380064769, Value: 67`). On real PS4 Pro this was fine; on shadPS4 it
+doubles the per-second render work which stacks with the
+`ResolveDepthOverlap` cost. Worth A/B-ing by disabling the patch once the
+depth-overlap cost is addressed, not before.
+
+### Status
+
+Open. No fix in this branch yet.
+
+## Upstream candidates
+
+Code that is clean enough to feed back to `shadps4-emu/shadPS4` once the
+experiment is validated:
+
+1. The swapchain `LOG_INFO` at `vk_swapchain.cpp::Create()` and the
+   `GetFrameViewFormat` per-format INFO log are broadly useful diagnostics
+   and would fit as a standalone PR (drop the `[gamma-dbg]` tag).
+2. Exposing the `pp.gamma` push-constant as a per-game JSON knob (my env-var
+   path is a branch-local shim; the real fix is a config field plumbed through
+   `emulator_settings.cpp`).
+3. Possibly a fix for the `A2R10G10B10Bt2020Pq → Unorm` fallthrough, once we
+   actually see a Driveclub session declare that format.
+
+Everything else in this branch is scoped to the investigation and wouldn't
+be upstreamed as-is.
+
+## File / path cheatsheet
+
+```
+# Fork source (this branch)
+~/Projects/shadPS4                 # akitaonrails/shadPS4, origin=fork, upstream=canonical
+~/Projects/DriveClubFS             # akitaonrails/DriveClubFS, origin=fork, upstream=Nenkai
+
+# Local build artifact
+/mnt/data/Projects/shadPS4/build/shadps4
+
+# Custom launcher (isolated, preserves working Manager setup)
+/mnt/data/distrobox/gaming/bin/shadps4-driveclub-gamma-debug
+
+# Production Manager path (unchanged)
+/mnt/data/distrobox/gaming/.local/share/shadPS4QtLauncher/versions/main-2026-04-19/Shadps4-sdl.AppImage
+
+# Driveclub install tree
+/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003                    # live (v1.28 now)
+/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003.v100-working-backup # rollback
+/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003-v128-test          # DriveClubFS input staging
+/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/Driveclub.v1.28.PATCH.REPACK.PS4-GCMR.pkg
+
+# shadPS4 data dirs
+~/.local/share/shadPS4/config.json                              # Vulkan.pipeline_cache_enabled=true
+~/.local/share/shadPS4/custom_configs/CUSA00003.json            # per-game (unchanged)
+~/.local/share/shadPS4/patches/Driveclub.xml                    # 60fps patch, re-enabled
+~/.local/share/shadPS4/log/shad_log.txt
+~/.local/share/shadPS4-gamma-dbg/                               # isolated wrapper's tree
+```
