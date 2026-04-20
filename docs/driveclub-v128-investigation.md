@@ -375,74 +375,148 @@ Remaining concerns carried into next phase:
 ## Priority note
 
 **2026-04-20, later:** Phase 2 (gamma) is resolved with the ACES +
-luma-preserving tonemap. Phase 4 (slowness) is now the active line of
-investigation — Driveclub under v1.28 is playable but feels like molasses,
-and the `ResolveDepthOverlap: Unimplemented depth overlap copy` spam is
-the most plausible cause.
+luma-preserving tonemap. Phase 4 (slowness + night-scene blackout) is
+also resolved — it turned out to be two separate problems conflated
+under "feels slow", see below.
 
-## Phase 4 — post-v1.28 slowness (deferred)
+## Phase 4 — "slowness" (resolved, two causes)
 
-### Evidence
+The subjective "game is running like molasses" had two separate roots.
+Pinned them one at a time.
 
-First post-swap session ran ~16 minutes. Log at
-`~/.local/share/shadPS4/log/shad_log.txt` shows:
+### Evidence collected from a real v1.28 session
 
-- **Pipeline cache enabled** ✓. This session compiled 864 shaders + 590
-  pipelines — up from ~881 for v1.00. The extra ~330 shader modules are
-  v1.28-specific content (new tracks, livery assets, etc.). Because the
-  pipeline cache was empty on first run with v1.28, all of these were
-  compiled fresh. `Cache dumped` on shutdown confirms the cache was
-  persisted, so this cost is one-shot.
+Log at `~/.local/share/shadPS4/log/shad_log.txt`:
+
+- **Pipeline cache enabled** ✓. First v1.28 session compiled 864 shaders
+  + 590 pipelines (vs ~881 total for v1.00). The extra ~330 shader
+  modules are v1.28-specific content — compiled fresh because the cache
+  was empty on first v1.28 launch. `Cache dumped` on shutdown confirms
+  persistence, so this cost is one-shot. Subsequent launches replay
+  instantly.
 - **1325 occurrences** of
-  `texture_cache.cpp:276 ResolveDepthOverlap: Unimplemented depth overlap copy`
-  in the log, clustered entirely in the in-game portion (first occurrence at
-  line 15587, heaviest density 400+ per 1000-line band after that). This is
-  the actual slowness signal — **not** a resource shortage on the RTX 5090
-  or the 7950X3D.
+  `texture_cache.cpp ResolveDepthOverlap: Unimplemented depth overlap copy`
+  clustered in the in-game portion. Smoking gun, but needed to know
+  which shape combinations were hitting.
 
-### Why it's slow
+### Root cause #1 — 60 fps patch causes slow-motion smooth playback
 
-The warning comes from `TextureCache::ResolveOverlap` in
-`src/video_core/texture_cache/texture_cache.cpp` around line 276. When the
-cache has an image at an address but the incoming binding has a different
-sample-count / depth semantic than the two supported fast paths
-(`new → color + multi-sample`, or `1-sample depth → MSAA depth expansion`),
-the code falls into an `else` that just `FreeImage`s the cached image,
-logs the warning, and returns the new image with **no data copy**.
+The user described the feel as "smooth but in slow motion" — frames
+arrive at a steady rate, cars accelerate slowly, lap time in 1 minute
+shows what should be half a lap, AI cars overtake normally at 25 km/h
+while the player's gauge reads 25 km/h.
 
-Every hit causes:
+This is the classic shape of "render rate and logic timestep out of
+sync". The `Driveclub.xml` 60 fps patch I re-enabled when we swapped
+to v1.28 was designed for PS4 Pro's 60 fps render pipeline — and from
+everything I've read these community eboot patches rewrite the render
+rate without touching the internal fixed-timestep game-logic rate.
+Real PS4 Pro's engine handles the mismatch internally; shadPS4 doesn't.
 
-- A Vulkan image free (driver state churn on NVIDIA).
-- A new allocation the next time the address is bound.
-- Broken read-after-write for whatever pipeline expected the cached contents.
+**Fix:** disable the patch:
 
-At hundreds of hits per frame the sheer allocator overhead is enough to
-explain the subjective slowdown. Separately, any rendering pass that
-expected the cached depth contents is getting undefined data — which might
-also be feeding the dim-image symptom through broken post-process input.
+```sh
+mv ~/.local/share/shadPS4/patches/Driveclub.xml \
+   ~/.local/share/shadPS4/patches/Driveclub.xml.disabled-for-v1.0
+```
 
-### Relevant upstream work
+Game reverts to 30 fps native cap; everything moves at the correct wall-
+clock speed. Confirmed by the user with a clean run. Tradeoff is 30 fps
+instead of 60, which matches stock PS4 behavior.
 
-- `#3667` "Handle mixed samples attachments (V2)" — merged.
-- `#3205` "texture_cache: Change depth resolve new image back to max of
-  resources." — merged.
+Long-term fix options (deferred):
+- Find/write a Driveclub patch that *also* scales the internal timestep.
+- Implement frame interpolation host-side (much larger scope, out of
+  scope for this branch).
 
-Both are already in our build. The `else` branch that logs
-`Unimplemented depth overlap copy` remains the catch-all, so there's real
-code to add there, not just a config tweak.
+### Root cause #2 — ResolveDepthOverlap gap breaks night scenes
 
-### 60 fps patch not ruled out yet
+Separate problem. After disabling the 60 fps patch the game runs at
+correct speed, but on a **night track the scene is near-pure black** —
+only HUD visible, no headlight cones, no track surface, no cars. Day
+scenes looked dim (Phase 2 handled that) but were mostly visible.
 
-The `Driveclub.xml` 60fps patch is active. It modifies the eboot's fixed
-tickrate (log: `Applied patch: 60 FPS with fixed tickrate, Offset:
-34380064769, Value: 67`). On real PS4 Pro this was fine; on shadPS4 it
-doubles the per-second render work which stacks with the
-`ResolveDepthOverlap` cost. Worth A/B-ing by disabling the patch once the
-depth-overlap cost is addressed, not before.
+Instrumenting the `else` branch in
+`TextureCache::ResolveDepthOverlap` (caching each unique shape
+combination and logging once per run) revealed a **single offender**
+hit over a thousand times per session:
+
+```
+cache(fmt=D32Sfloat     depth=true  stencil=false samples=4)
+  -> new(fmt=R32G32B32A32Sfloat depth=false stencil=false samples=1)
+  binding=1 (Texture)
+```
+
+Driveclub's forward+ / screen-space lighting renders geometry into a
+**4x MSAA depth target**, then binds that depth aspect as a **1-sample
+R32G32B32A32Sfloat sampler2D** for the lighting accumulation pass,
+SSAO, soft particle edges, etc. shadPS4's resolver didn't have a path
+for this combination, so the `else` branch just `FreeImage`-d the
+cached MSAA depth and returned an uninitialised 1-sample color image.
+Every depth-based effect downstream was reading garbage.
+
+**Why day was "only dim" and night was "pure black":** day scenes have
+strong ambient + sun lighting baked into the material pass; the broken
+depth-sampled passes just subtly wash out details we papered over
+with exposure. Night scenes rely entirely on screen-space volumetric
+headlights keyed off the depth buffer — no depth → no lights → no
+scene.
+
+### Fix shape in this branch
+
+Mirror of the existing `BlitHelper::ReinterpretColorAsMsDepth` path
+(which already handles the opposite direction, 1x color → MSAA depth).
+
+- **New fragment shader**
+  `src/video_core/host_shaders/ms_depth_to_color.frag` — fullscreen
+  triangle, binds source as `texture2DMS`, `texelFetch`es sample 0 per
+  pixel, writes `vec4(depth, 0, 0, 1)` to the color attachment. Sample
+  0 is used verbatim rather than averaging — depth sampling downstream
+  wants a specific visibility decision, not an intermediate.
+- **New helper**
+  `BlitHelper::ReinterpretMsDepthAsColor(width, height, num_samples,
+  src_fmt, dst_fmt, source, dest)` — creates a depth-aspect sampled
+  view on the source, a color-aspect attachment view on the dest,
+  binds a cached pipeline keyed by `(num_samples, dst_format)`, draws
+  the fullscreen triangle through the new fragment shader. Pipeline's
+  `rasterizationSamples = e1` because the destination is 1x; the
+  shader itself does the per-sample fetch.
+- **Wiring**: new `else if` branch in
+  `TextureCache::ResolveDepthOverlap` that matches the shape
+  `cache.is_depth && cache.samples > 1 && !new.is_depth &&
+  new.samples == 1` and dispatches `ReinterpretMsDepthAsColor`. The
+  pre-existing `else` is kept with the shape-logging instrumentation
+  so any *other* unhandled combination is still caught for future
+  debugging.
+
+### Verified behaviour
+
+Confirmed on the user's RTX 5090 + 7950X3D box after redeploying the
+binary through the gamma-debug QtLauncher entry:
+
+- `[depth-dbg] Unimplemented depth overlap copy` warnings disappear for
+  the D32Sfloat → R32G32B32A32Sfloat case (Driveclub's only offender).
+- Night tracks: car headlights illuminate the road, track boundaries
+  visible, AI car lights visible — screen-space lighting stack back
+  online.
+- Day tracks: subtle tightening of depth-dependent effects; no
+  regressions observed.
 
 ### Status
 
-Open. No fix in this branch yet.
+**Resolved.** Both mechanisms addressed. Candidates for upstream:
+
+1. `BlitHelper::ReinterpretMsDepthAsColor` + its shader + the
+   `TextureCache::ResolveDepthOverlap` wiring are a clean, bounded
+   fix. Good upstream PR shape — symmetric with the existing
+   `ReinterpretColorAsMsDepth` path. Drop the `[depth-dbg]` tag
+   before submitting; the shape-logging instrumentation is a
+   reasonable addition on its own but can be a separate PR or left
+   out of the fix PR.
+2. The 60 fps patch issue is user configuration rather than an
+   emulator bug, so nothing to upstream from that root cause —
+   documenting it here for any future Driveclub guide on the
+   compatibility repo.
 
 ## Upstream candidates
 
