@@ -11,6 +11,7 @@ set(SHADER_FILES
     detilers/micro_32bpp.comp
     detilers/micro_64bpp.comp
     detilers/micro_8bpp.comp
+    auto_exposure.comp
     color_to_ms_depth.frag
     ms_depth_to_color.frag
     ms_image_blit.frag
