@@ -236,19 +236,87 @@ variant could not.
 
 ### Status
 
-**Resolved for Driveclub** with the three env-var knobs. Follow-up work
-before this can be upstreamed:
+**Resolved for Driveclub** — by building a substantial tonemap toolkit
+and then realising Driveclub doesn't need it.
 
-1. Expose the three knobs as per-game JSON fields (`Gpu.pp_gamma`,
-   `Gpu.pp_exposure`, `Gpu.pp_tonemap`), with env vars kept as a debug
-   escape hatch.
-2. Drop the `[gamma-dbg]` tags from `LOG_INFO` strings before a PR (the
-   `Swapchain created` and `Video-out PixelFormat` logs are useful
-   enough to upstream on their own merits).
-3. Consider whether `tonemap_mode=1` (luma-preserving) should be the
-   default. It's clearly the "right" math for under-bright SDR source,
-   but changing the default changes output for every game — needs an
-   A/B on more titles first.
+The pipeline now supports gamma/exposure/ACES/auto-exposure/dither as
+opt-in SDR post-process features, but the correct default for Driveclub
+(and probably a lot of stock SDR titles) is **bypass**: the game writes
+already-correct SDR, we just sRGB-encode and present.
+
+### Lesson: when to use the tonemap chain, and when not to
+
+A chunk of this investigation was spent fighting a symptom — "the scene
+looks dim" — with progressively more aggressive corrections (manual
+exposure, per-channel ACES, luma-preserving ACES, auto-exposure with
+histogram analysis, shadow-lift curves, peak-aware clamping, mean-aware
+headroom, hysteresis adaptation). Each fixed one case by breaking
+another: menus would blow out when dark scenes got lifted, or dim
+scenes would stay dim when menus were tamed.
+
+The breakthrough came from adding a `SHADPS4_PP_BYPASS=1` env var that
+skipped the entire tonemap/exposure chain and just sRGB-encoded the
+raw video-out framebuffer. **With bypass on, Driveclub looked correct
+in every scene**: menus bright and vivid, races properly-exposed,
+night atmospheric, dawn moody. The only remaining dim pocket is a
+5-second in-game fade at race start that is **the game's own rendering
+effect** — a cinematic reveal where Driveclub itself writes low values
+to its framebuffer for a few seconds before transitioning to full
+brightness. Nothing we do in post-process affects that; it's
+gameplay-side VFX.
+
+So the right reading of the whole saga is:
+
+  - shadPS4 without any SDR post-process produces **correct** output
+    for games that write already-correct SDR values to their framebuffer.
+    Driveclub is one of those.
+  - The post-process machinery (ACES tonemap, exposure, gamma, auto)
+    is only needed for games whose output is truly HDR-intent and
+    needs to be compressed into SDR. Those exist — Bloodborne,
+    God of War, etc. — but the treatment should be opt-in per game,
+    not a default that mangles games like Driveclub.
+  - "The scene looks dim" as a bug report has two very different root
+    causes: (a) emulator post-process is crushing an already-correct
+    image, or (b) the game legitimately writes dim values intending
+    HDR amplification. A diagnostic bypass tells you which without
+    having to guess.
+
+### Final configuration in `gamma-debug`
+
+Wrapper defaults applied by the QtLauncher version entry:
+
+```
+SHADPS4_PP_BYPASS=1          # shader does sRGB-encode only
+SHADPS4_PP_AUTO_EXPOSURE=0   # compute dispatch skipped
+SHADPS4_PP_EXPOSURE=1.0      # neutral (only takes effect if bypass=0)
+SHADPS4_PP_TONEMAP=luma      # also gated by bypass
+# SHADPS4_PP_GAMMA_OVERRIDE unset — shader uses standard sRGB
+```
+
+The auto-exposure compute pass, ACES shaders, dither pattern, and the
+manual gamma/exposure/tonemap push-constants all stay in the codebase
+as opt-in features. Default behaviour at the shader level remains
+canonical SDR: `linear × 1.0 → ACES → sRGB → dither` if bypass is off;
+with the wrapper having bypass on, that whole chain is skipped.
+
+### Upstream candidates
+
+Before anything can be upstreamed:
+
+1. The `auto_exposure_pass` + its compute shader is a reasonable
+   feature in isolation — could go upstream as opt-in behind a config
+   flag, not a default. Needs A/B testing against multiple titles
+   before becoming a default.
+2. The ACES tonemap and luma-preserving variant are useful for
+   HDR-intent games. Upstream would likely want them as a per-game
+   JSON field (`Gpu.tonemap_mode`), not an env var. Drop the
+   `[gamma-dbg]` log tags before PR.
+3. The Bayer dither is a universal win on 8-bit swapchains and could
+   go upstream unconditionally.
+4. Bypass mode is either a keep-out (it's weird to ship an escape
+   hatch as a feature) or it becomes the *default* and the tonemap
+   chain becomes opt-in — either way it's an upstream conversation
+   that can happen after the rest of the features stabilise.
 
 ## Phase 3 — v1.28 content access
 
