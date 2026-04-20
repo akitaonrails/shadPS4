@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <unordered_set>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -273,8 +274,51 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
                 new_info.size.width, new_info.size.height, new_info.num_samples,
                 cache_image.info.pixel_format, new_info.pixel_format, cache_image.GetImage(),
                 new_image.GetImage());
+        } else if (cache_image.info.props.is_depth && cache_image.info.num_samples > 1 &&
+                   !new_info.props.is_depth && new_info.num_samples == 1) {
+            // Reverse direction of the branch above: resolve an MSAA depth buffer into a
+            // single-sample color target so the game can sample it as sampler2D. This is the
+            // shape Driveclub hits every frame for screen-space lighting / SSAO / soft
+            // particles, and before this was implemented the `else` below just freed the
+            // cache image and returned an uninitialized color buffer, breaking any effect
+            // that relied on post-resolve depth.
+            cache_image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+                                vk::AccessFlagBits2::eShaderRead, {});
+            new_image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+                              vk::AccessFlagBits2::eColorAttachmentWrite, {});
+            blit_helper.ReinterpretMsDepthAsColor(
+                new_info.size.width, new_info.size.height, cache_image.info.num_samples,
+                cache_image.info.pixel_format, new_info.pixel_format, cache_image.GetImage(),
+                new_image.GetImage());
         } else {
-            LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
+            // Log shape combination of the hit so we can characterise the
+            // actual cases falling through. Throttled to each unique shape
+            // combo once per run.
+            static std::unordered_set<u64> seen_shapes;
+            const u64 key =
+                (static_cast<u64>(cache_image.info.num_samples) << 56) |
+                (static_cast<u64>(new_info.num_samples) << 48) |
+                (static_cast<u64>(cache_image.info.props.is_depth ? 1 : 0) << 47) |
+                (static_cast<u64>(new_info.props.is_depth ? 1 : 0) << 46) |
+                (static_cast<u64>(cache_image.info.props.has_stencil ? 1 : 0) << 45) |
+                (static_cast<u64>(new_info.props.has_stencil ? 1 : 0) << 44) |
+                (static_cast<u64>(static_cast<u32>(binding)) << 32) |
+                (static_cast<u64>(static_cast<u32>(cache_image.info.pixel_format)) << 16) |
+                static_cast<u64>(static_cast<u32>(new_info.pixel_format));
+            if (seen_shapes.insert(key).second) {
+                LOG_WARNING(Render_Vulkan,
+                            "[depth-dbg] Unimplemented depth overlap copy: "
+                            "cache(fmt={} depth={} stencil={} samples={}) -> "
+                            "new(fmt={} depth={} stencil={} samples={}) binding={}",
+                            vk::to_string(cache_image.info.pixel_format),
+                            static_cast<bool>(cache_image.info.props.is_depth),
+                            static_cast<bool>(cache_image.info.props.has_stencil),
+                            cache_image.info.num_samples,
+                            vk::to_string(new_info.pixel_format),
+                            static_cast<bool>(new_info.props.is_depth),
+                            static_cast<bool>(new_info.props.has_stencil),
+                            new_info.num_samples, static_cast<u32>(binding));
+            }
         }
 
         // Free the cache image.

@@ -30,6 +30,15 @@ public:
                                    vk::Format src_pixel_format, vk::Format dst_pixel_format,
                                    vk::Image source, vk::Image dest);
 
+    // Resolves a multi-sample depth image into a single-sample color image:
+    // sample 0 of the depth value is written to the R channel of the dest.
+    // Used by TextureCache::ResolveDepthOverlap when the game has rendered to
+    // an MSAA depth target and later wants to sample it as a 1x color texture
+    // (e.g. Driveclub's screen-space lighting / SSAO / soft particles).
+    void ReinterpretMsDepthAsColor(u32 width, u32 height, u32 num_samples,
+                                   vk::Format src_pixel_format, vk::Format dst_pixel_format,
+                                   vk::Image source, vk::Image dest);
+
     void CopyBetweenMsImages(u32 width, u32 height, u32 num_samples, vk::Format pixel_format,
                              bool src_msaa, vk::Image source, vk::Image dest);
 
@@ -45,6 +54,7 @@ private:
         auto operator<=>(const MsPipelineKey&) const noexcept = default;
     };
     void CreateColorToMSDepthPipeline(const MsPipelineKey& key);
+    void CreateMsDepthToColorPipeline(const MsPipelineKey& key);
     void CreateMsCopyPipeline(const MsPipelineKey& key);
 
 private:
@@ -54,11 +64,13 @@ private:
     vk::UniquePipelineLayout single_texture_pl_layout;
     vk::ShaderModule fs_tri_vertex;
     vk::ShaderModule color_to_ms_depth_frag;
+    vk::ShaderModule ms_depth_to_color_frag;
     vk::ShaderModule src_msaa_copy_frag;
     vk::ShaderModule src_non_msaa_copy_frag;
 
     using MsPipeline = std::pair<MsPipelineKey, vk::UniquePipeline>;
     std::vector<MsPipeline> color_to_ms_depth_pl;
+    std::vector<MsPipeline> ms_depth_to_color_pl;
     std::vector<MsPipeline> ms_image_copy_pl;
 };
 
