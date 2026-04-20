@@ -7,7 +7,6 @@
 
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
-#include "video_core/renderer_vulkan/host_passes/auto_exposure_pass.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -119,8 +118,6 @@ private:
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
-    HostPasses::AutoExposurePass auto_exposure_pass;
-    HostPasses::AutoExposurePass::Settings auto_exposure_settings{};
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
     Scheduler present_scheduler;
@@ -137,12 +134,6 @@ private:
     std::condition_variable_any frame_cv;
     std::optional<ImGui::RefCountedTexture> splash_img;
     std::vector<VAddr> vo_buffers_addr;
-    float pp_gamma_override{-1.0f};    // SHADPS4_PP_GAMMA_OVERRIDE, <0 means unset
-    float pp_exposure_override{-1.0f}; // SHADPS4_PP_EXPOSURE, <0 means unset
-    int pp_tonemap_mode_override{-1};  // SHADPS4_PP_TONEMAP (0|1), <0 means unset
-    bool pp_auto_exposure_enabled{false}; // SHADPS4_PP_AUTO_EXPOSURE=1
-    bool pp_auto_exposure_initialized{false}; // did CPU seed the manual value yet
-    bool pp_bypass_enabled{false};            // SHADPS4_PP_BYPASS=1 (diagnostic)
 };
 
 } // namespace Vulkan

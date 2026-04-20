@@ -28,12 +28,6 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
         },
-        {
-            .binding = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eFragment,
-        },
     };
 
     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci{
@@ -193,8 +187,7 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 }
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                                vk::Extent2D input_size, Frame& frame, Settings settings,
-                                vk::Buffer auto_exposure_buffer) {
+                                vk::Extent2D input_size, Frame& frame, Settings settings) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -231,11 +224,6 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .imageView = input,
         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
-    const vk::DescriptorBufferInfo buffer_info{
-        .buffer = auto_exposure_buffer,
-        .offset = 0,
-        .range = VK_WHOLE_SIZE,
-    };
 
     const std::array set_writes{
         vk::WriteDescriptorSet{
@@ -245,14 +233,6 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &image_info,
-        },
-        vk::WriteDescriptorSet{
-            .dstSet = VK_NULL_HANDLE,
-            .dstBinding = 1,
-            .dstArrayElement = 0,
-            .descriptorCount = 1,
-            .descriptorType = vk::DescriptorType::eStorageBuffer,
-            .pBufferInfo = &buffer_info,
         },
     };
 

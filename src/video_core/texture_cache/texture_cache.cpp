@@ -307,7 +307,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
                 static_cast<u64>(static_cast<u32>(new_info.pixel_format));
             if (seen_shapes.insert(key).second) {
                 LOG_WARNING(Render_Vulkan,
-                            "[depth-dbg] Unimplemented depth overlap copy: "
+                            "Unimplemented depth overlap copy: "
                             "cache(fmt={} depth={} stencil={} samples={}) -> "
                             "new(fmt={} depth={} stencil={} samples={}) binding={}",
                             vk::to_string(cache_image.info.pixel_format),
