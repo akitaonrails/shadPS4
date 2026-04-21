@@ -24,6 +24,8 @@ class Scheduler;
 class RenderState;
 class GraphicsPipeline;
 
+bool IsDriveclubRaceWindowActive();
+
 class Rasterizer {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler,

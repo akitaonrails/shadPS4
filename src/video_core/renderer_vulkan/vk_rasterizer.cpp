@@ -3,11 +3,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <mutex>
 #include <unordered_set>
 
 #include "common/debug.h"
+#include "common/memory_patcher.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
@@ -27,6 +29,125 @@
 namespace Vulkan {
 
 namespace {
+
+constexpr std::array<u64, 12> kDriveclubLaterRaceGatePipelines{
+    0x967922c49cee2dd1ull, 0xe72e555cdb85af86ull, 0xb98e78a7a28007ceull,
+    0x3ff0fc8f05bc302dull, 0xd14226a181106f7eull, 0x1bb555896c9e247eull,
+    0xff9e11acb5a72dffull, 0x5148c06fb63b96e0ull, 0x660a29eb5e92b0adull,
+    0xfe66b45b84a7dd16ull, 0x02c197f768d8d430ull, 0xf6e5670be11b0009ull,
+};
+
+constexpr std::array<u64, 2> kDriveclubEarlyGatePipelines{
+    0x1cdd747ee89204c0ull,
+    0x6bde71906ac1af18ull,
+};
+
+constexpr u32 kDriveclubRaceWindowSubmits = 32;
+constexpr u32 kDriveclubRaceGateMinHashes = 3;
+
+struct DriveclubRaceGateSubmitState {
+    u64 submit_index{};
+    std::array<u64, 8> hashes{};
+    u32 num_hashes{};
+    bool has_depth{};
+    bool has_visible_target{};
+    bool has_hdr_target{};
+};
+
+std::atomic<u64> g_driveclub_submit_index{};
+std::atomic<u32> g_driveclub_race_window{};
+std::mutex g_driveclub_gate_mutex;
+DriveclubRaceGateSubmitState g_driveclub_gate_state{};
+
+bool IsDriveclubGuardEnabled() {
+    static const bool enabled = MemoryPatcher::g_game_serial == "CUSA00003";
+    return enabled;
+}
+
+bool IsDriveclubLaterRaceGatePipeline(u64 pipeline_hash) {
+    return std::ranges::find(kDriveclubLaterRaceGatePipelines, pipeline_hash) !=
+           kDriveclubLaterRaceGatePipelines.end();
+}
+
+bool IsDriveclubEarlyGatePipeline(u64 pipeline_hash) {
+    return std::ranges::find(kDriveclubEarlyGatePipelines, pipeline_hash) !=
+           kDriveclubEarlyGatePipelines.end();
+}
+
+void ResetDriveclubGateState(DriveclubRaceGateSubmitState& state, u64 submit_index) {
+    state.submit_index = submit_index;
+    state.hashes.fill(0);
+    state.num_hashes = 0;
+    state.has_depth = false;
+    state.has_visible_target = false;
+    state.has_hdr_target = false;
+}
+
+void InsertDriveclubGateHash(DriveclubRaceGateSubmitState& state, u64 pipeline_hash) {
+    for (u32 i = 0; i < state.num_hashes; ++i) {
+        if (state.hashes[i] == pipeline_hash) {
+            return;
+        }
+    }
+    if (state.num_hashes < state.hashes.size()) {
+        state.hashes[state.num_hashes++] = pipeline_hash;
+    }
+}
+
+void NoteDriveclubRaceGateCandidate(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs) {
+    if (!IsDriveclubGuardEnabled()) {
+        return;
+    }
+
+    const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey());
+    if (IsDriveclubEarlyGatePipeline(pipeline_hash) ||
+        !IsDriveclubLaterRaceGatePipeline(pipeline_hash)) {
+        return;
+    }
+
+    bool has_visible_target = false;
+    bool has_hdr_target = false;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col_buf = regs.color_buffers[cb];
+        if (!col_buf) {
+            continue;
+        }
+        switch (col_buf.Address()) {
+        case 0x500cdd0000ull:
+            has_visible_target = true;
+            break;
+        case 0x5009688000ull:
+        case 0x5008130000ull:
+        case 0x500fdd0000ull:
+            has_hdr_target = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (!regs.depth_buffer.DepthValid() || !has_visible_target || !has_hdr_target) {
+        return;
+    }
+
+    const u64 submit_index = g_driveclub_submit_index.load();
+    std::lock_guard lock{g_driveclub_gate_mutex};
+    auto& state = g_driveclub_gate_state;
+    if (state.submit_index != submit_index) {
+        ResetDriveclubGateState(state, submit_index);
+    }
+    state.has_depth = true;
+    state.has_visible_target = true;
+    state.has_hdr_target = true;
+    InsertDriveclubGateHash(state, pipeline_hash);
+
+    if (state.num_hashes >= kDriveclubRaceGateMinHashes &&
+        g_driveclub_race_window.exchange(kDriveclubRaceWindowSubmits) == 0) {
+        LOG_INFO(Render_Vulkan,
+                 "[dc-gate] armed submit={} hashes={} visible=true hdr=true depth=true",
+                 submit_index, state.num_hashes);
+    }
+}
 
 // Driveclub torture probe. Enable with env SHADPS4_DC_TORTURE=1.
 // For draws whose color attachments target one of the critical full-res
@@ -122,6 +243,10 @@ void LogTortureSubOnce(VAddr dst_addr, VAddr src_addr, u32 w, u32 h, vk::Format 
 }
 
 } // namespace
+
+bool IsDriveclubRaceWindowActive() {
+    return IsDriveclubGuardEnabled() && g_driveclub_race_window.load() > 0;
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -302,6 +427,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         return;
     }
+    NoteDriveclubRaceGateCandidate(pipeline, regs);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -350,6 +476,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
+    NoteDriveclubRaceGateCandidate(pipeline, liverpool->regs);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -473,6 +600,10 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    g_driveclub_submit_index.fetch_add(1);
+    if (const u32 remaining = g_driveclub_race_window.load(); remaining > 0) {
+        g_driveclub_race_window.store(remaining - 1);
+    }
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
