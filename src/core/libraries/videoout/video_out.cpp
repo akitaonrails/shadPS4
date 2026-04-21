@@ -11,6 +11,7 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -406,6 +407,7 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
 
     LOG_INFO(Lib_VideoOut, "sceVideoOutAdjustColor: handle={} gamma={}", handle, settings->gamma);
     presenter->GetPPSettingsRef().gamma = settings->gamma;
+    Vulkan::NoteDriveclubVideoOutGamma(settings->gamma);
     return ORBIS_OK;
 }
 

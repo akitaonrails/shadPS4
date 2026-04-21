@@ -44,6 +44,7 @@ constexpr std::array<u64, 2> kDriveclubEarlyGatePipelines{
 
 constexpr u32 kDriveclubRaceWindowSubmits = 32;
 constexpr u32 kDriveclubRaceGateMinHashes = 3;
+constexpr u32 kDriveclubGammaHintWindowSubmits = 96;
 
 struct DriveclubRaceGateSubmitState {
     u64 submit_index{};
@@ -56,6 +57,7 @@ struct DriveclubRaceGateSubmitState {
 
 std::atomic<u64> g_driveclub_submit_index{};
 std::atomic<u32> g_driveclub_race_window{};
+std::atomic<u64> g_driveclub_gamma_hint_until_submit{};
 std::mutex g_driveclub_gate_mutex;
 DriveclubRaceGateSubmitState g_driveclub_gate_state{};
 
@@ -131,6 +133,10 @@ void NoteDriveclubRaceGateCandidate(const GraphicsPipeline* pipeline, const AmdG
     }
 
     const u64 submit_index = g_driveclub_submit_index.load();
+    const u64 gamma_hint_until_submit = g_driveclub_gamma_hint_until_submit.load();
+    if (submit_index > gamma_hint_until_submit) {
+        return;
+    }
     std::lock_guard lock{g_driveclub_gate_mutex};
     auto& state = g_driveclub_gate_state;
     if (state.submit_index != submit_index) {
@@ -246,6 +252,17 @@ void LogTortureSubOnce(VAddr dst_addr, VAddr src_addr, u32 w, u32 h, vk::Format 
 
 bool IsDriveclubRaceWindowActive() {
     return IsDriveclubGuardEnabled() && g_driveclub_race_window.load() > 0;
+}
+
+void NoteDriveclubVideoOutGamma(float gamma) {
+    if (!IsDriveclubGuardEnabled()) {
+        return;
+    }
+    if (gamma < 0.49f || gamma > 0.51f) {
+        return;
+    }
+    const u64 submit_index = g_driveclub_submit_index.load();
+    g_driveclub_gamma_hint_until_submit.store(submit_index + kDriveclubGammaHintWindowSubmits);
 }
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {

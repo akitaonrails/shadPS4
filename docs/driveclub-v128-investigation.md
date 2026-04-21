@@ -1395,6 +1395,14 @@ The clean passive discriminator established a safer coarse gate:
   arm signals
 - explicitly exclude the early submit-97 hashes that also appeared
   before the real race-start path settled
+- require a recent `sceVideoOutAdjustColor(... gamma=0.5)` pulse before the
+  later race-like draw cluster is allowed to arm the race window
+
+That extra gamma hint matters because the pipeline-only guard still caught
+menu-loading lookalikes. The baseline-safe guard now requires both:
+
+- a recent `gamma=0.5` video-out hint
+- the later race-like draw signature with visible target + HDR target + depth
 
 Later race-like hashes seen in the passive `[dc-gate]` run:
 

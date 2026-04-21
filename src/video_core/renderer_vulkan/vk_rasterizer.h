@@ -25,6 +25,7 @@ class RenderState;
 class GraphicsPipeline;
 
 bool IsDriveclubRaceWindowActive();
+void NoteDriveclubVideoOutGamma(float gamma);
 
 class Rasterizer {
 public:
