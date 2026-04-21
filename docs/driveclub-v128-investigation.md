@@ -1480,3 +1480,173 @@ Persistent baseline guard:
 ~/.local/share/shadPS4/log/shad_log.txt
 ~/.local/share/shadPS4-gamma-dbg/                               # isolated wrapper's tree
 ```
+
+## Clean misses after the fixed race gate
+
+With the hardened race-window guard in place, the following additional
+families were probed and still did **not** materially disturb the
+blackout itself:
+
+1. Scheduler / timeline slowdown family
+   - forcing `Finish()` around the race-start window made the game slow
+     but left the blackout unchanged
+   - this rules out the coarse "GPU is simply finishing too late"
+     timing theory
+2. `sceVideoOutAdjustColor` / host gamma family
+   - stubbing out the gamma write and forcing presenter gamma to stay
+     at `1.0` did not move the blackout
+3. Host final-output family
+   - bypassing host FSR and host post-process and presenting the raw
+     guest video-out image still left the blackout intact
+   - this is a clean miss against the "final overlay / final postfx"
+     theory
+4. Video-out label / flip-wait family
+   - forcing VO labels ready and bypassing the VO wait path during the
+     race window fell back to baseline behavior with the blackout still
+     intact
+
+Current clean takeaway:
+
+- the blackout is upstream of host present
+- it is not explained by `sceVideoOutAdjustColor`
+- it is not explained by coarse GPU slowdown / forced finish
+- it is not explained by the VO label / flip wait path
+
+That means the remaining lead should move away from final output and
+toward a game-side camera / postfx / prerace system or another shared
+upstream branch.
+
+## Manual asset sweep: strongest new lead
+
+A broad string sweep across the installed v1.28 game files found
+something much more plausible than the previous renderer-side guesses:
+
+- the actual race track packs contain explicit prerace camera actors
+- those same packs contain explicit postfx config actors and exposure
+  fields
+- global data contains generic fade/postfx override tracks
+
+This is the most important cluster found in the asset files so far.
+
+### Evidence in track packs
+
+The actual track `.rpk` files under `data/leveldata/` contain names such
+as:
+
+- `new_preracecam_*`
+- `preracecam_*`
+- `cutsccam`
+- `worldcam`
+- `pre_race_*`
+- `track_preview`
+- `PostFXConfig_interior`
+- `PostFXConfig_exterior`
+- `PostFXConfig_helmet`
+
+They also contain explicit camera/postfx scalar names embedded directly
+in the binary data:
+
+- `ManualExposureLog2`
+- `AutoTargetLuminance`
+- `ManualAutoMix`
+- `AutoMaxLuminance`
+- `AutoSpeed`
+- `MasterBrightness`
+- `TemporalFade`
+- `ColourRemapVolumeName`
+- `FocusDistance2`
+- `ApertureFNumber`
+- `ShutterSpeed`
+- `DepthOfField`
+- `ShowDOFLerp`
+
+This is not generic UI text. These strings live inside the race-track
+resource packs themselves, next to the prerace camera actor data.
+
+### Evidence in global asset packs and UI
+
+`data/leveldata/globaldata.rpk` contains generic fade/postfx names such
+as:
+
+- `FadeIn`
+- `FadeOut`
+- `FadeIn_Fast`
+- `FadeOut_Fast`
+- `RTT_BLUR_ON`
+- `RTT_BLUR_OFF`
+- `RTT_GRADING_ON`
+- `RTT_GRADING_OFF`
+- `PostFX_ColourGradingOverride`
+- `PostFX_BloomOverride_*`
+
+The UI tree also contains ordinary page transitions like `BootFade` and
+`FadeOut`, but those are almost certainly just menu/UI transitions and
+should not be treated as evidence of the race blackout by themselves.
+
+### Why this matters
+
+This asset-side evidence fits the observed behavior better than the
+previous renderer-side families:
+
+- the blackout begins at race start rather than at final present
+- mirror and main camera both seem to obey the same visibility timing
+- the duration is variable, which fits prerace-camera / postfx / track
+  state better than a simple hardcoded final overlay
+- the track packs explicitly define prerace cameras and postfx controls
+  in the same resource neighborhood
+
+Current best hypothesis:
+
+- the blackout is more likely tied to a **prerace camera / cutscene /
+  PostFXConfig system** than to the final presenter or the visible
+  race-scene color chain itself
+- likely suspects inside that family are `TemporalFade`,
+  `MasterBrightness`, luminance/exposure controls, colour-remap
+  volumes, or a prerace-camera handoff that temporarily drives those
+  values
+
+## External tooling / level inspection
+
+There is no evidence yet of a turnkey "open the whole track in Blender
+and watch the blackout" path.
+
+What does exist locally:
+
+- `DriveClubFS` can unpack `.ndx + .dat` and extract binary resources,
+  XML, and textures from `.rpk`
+- the local tool explicitly supports Driveclub `1.28`
+- resource types include `RTUID_SCENE`, `RTUID_CAMERA`,
+  `RTUID_MATERIAL`, `RTUID_SHADER`, `RTUID_LEVEL_DATA`, and
+  `RTUID_GUI_ANIM`
+- a local `data/nexus/viewer/config.xml` exists, which suggests
+  Evolution had some kind of Nexus viewer workflow
+
+Practical interpretation:
+
+- yes, we can extract track packs and inspect textures / XML / binary
+  resources externally
+- no, there is not yet a proven generic DCC path in this investigation
+  for loading the whole assembled level with live postfx behavior
+- the most realistic external next step is to use `DriveClubFS` against
+  one track pack and inspect the extracted `PostFXConfig_*`, camera, and
+  related XML/bin resources directly
+
+## Probe direction after the asset sweep
+
+Do **not** default back to another generic renderer-side shotgun.
+
+The best next brute-force direction is now the track-side prerace/postfx
+family:
+
+1. Extract one race track `.rpk` and inspect the `preracecam` /
+   `PostFXConfig_*` resources directly.
+2. Add a broad runtime probe aimed at the prerace/postfx handoff rather
+   than the final color chain.
+3. If a runtime hook is feasible, neutralize the likely scalar family at
+   once:
+   - `TemporalFade`
+   - `MasterBrightness`
+   - `ManualExposureLog2`
+   - `AutoTargetLuminance`
+   - `AutoSpeed`
+   - colour-remap / grading overrides
