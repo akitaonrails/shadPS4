@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="DriveClubFS.Resources">
+      <HintPath>/mnt/data/distrobox/gaming/tools/DriveClubFS/DriveClubFS/bin/Release/net10.0/DriveClubFS.Resources.dll</HintPath>
+    </Reference>
+    <Reference Include="DriveClubFS.Utils">
+      <HintPath>/mnt/data/distrobox/gaming/tools/DriveClubFS/DriveClubFS/bin/Release/net10.0/DriveClubFS.Utils.dll</HintPath>
+    </Reference>
+    <Reference Include="Syroot.BinaryData">
+      <HintPath>/mnt/data/distrobox/gaming/tools/DriveClubFS/DriveClubFS/bin/Release/net10.0/Syroot.BinaryData.dll</HintPath>
+    </Reference>
+    <Reference Include="Syroot.BinaryData.Core">
+      <HintPath>/mnt/data/distrobox/gaming/tools/DriveClubFS/DriveClubFS/bin/Release/net10.0/Syroot.BinaryData.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="Syroot.BinaryData.Memory">
+      <HintPath>/mnt/data/distrobox/gaming/tools/DriveClubFS/DriveClubFS/bin/Release/net10.0/Syroot.BinaryData.Memory.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

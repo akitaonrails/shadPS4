@@ -421,3 +421,13 @@ cmake-build-*
 
 # Nix Result symlink
 result
+
+# Fork-local investigation artefacts (proprietary game content,
+# extracted eboot, overlay tree, patched .rpks, probe dumps).
+# Anything under tmp/ is derived from the installed Driveclub game
+# and must not be checked in.
+/tmp/
+
+# C# tool build outputs (tools/*/bin, tools/*/obj). Source only.
+/tools/*/bin/
+/tools/*/obj/

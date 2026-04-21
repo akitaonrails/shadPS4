@@ -1451,6 +1451,528 @@ Persistent baseline guard:
 - future broad shots should key off that latched race window rather than
   the later whitelist alone
 
+## Phase 8 — UI-asset surgery (2026-04-21)
+
+All the asset-side probes in this phase were scoped to Driveclub
+`CUSA00003` v1.28 running through
+`scripts/run_driveclub_overlay.sh`, with the patched `.rpk`s and UI
+text panels dropped into
+`/mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003`. The
+overlay dir is a symlink mirror of the installed game with only the
+patched files as real content.
+
+### Baseline on entry to this phase
+
+From the prior asset-patch work:
+
+- Track-pack `PostFXConfig_{interior,exterior,helmet}` inline scalars
+  zeroed (TemporalFade, ManualExposureLog2, ManualAutoMix, Master-
+  Brightness, WeatherOverrideMix, MotionBlurLevel).
+- All prerace camera `Fade` values zeroed (old `preracecam_*`, new
+  `new_preracecam_*`, `CutsceneCamera_*`, `WorldCamera_*`,
+  `track_preview`).
+- India night LUT references rewritten to India day LUTs.
+- Prerace animationlib `Fade` track keyframes zeroed.
+- `globaldata.rpk` kept at vanilla (prior patches there were
+  unstable).
+
+Observed effect of that baseline: the vanilla "fade to near-black" at
+race start is **replaced by a semi-transparent static image of the
+selected car** over the live race, with the race faintly visible
+underneath and HUD intact on top. Same variable ~5-30 s duration
+with occasional "never recovers".
+
+### Iteration 2.1 — PostFXConfig bucket A (TXAA / NonBloomed)
+
+`TXAAOverallWeight = 0`, `TXAAColourClamping = 0`,
+`NonBloomedAttenuation = 0` on all three `PostFXConfig_*`.
+
+Result: the overlay became **permanent instead of gradually lifting**.
+This inverted the earlier framing. Those PostFX fields were not the
+overlay's source; they were part of the decay that eventually washed
+it out. Reverted. Kept `Iteration 2.0` attempted combined shot notes
+and the learning in
+`docs/driveclub-next-test-plan.md`.
+
+### Iteration 2.0 — Transition/ManualExposureLog2 animlib sweep
+
+`PatchTransitionTracks` and `PatchNamedTrackKeyframes` reused the
+`Fade`-layout offsets (`0x2c / 0x4c / 0x6c`) blindly wherever the
+ASCII field name appeared inside the animationlib resource. This
+corrupted the keyframe stride of other curves and crashed the game's
+`.rpk` parser during race load (null-ptr read in the eboot at
+`0x80067894a`). Both helpers are still in `Program.cs` as dead code
+behind guarded call sites for a future safer decoder.
+
+### Iteration 3.x — newui panel sweep
+
+The overlay persisted across every UI panel disable we tried. In
+order:
+
+1. `vehicle_select_background.txt` — set all gradient `A_RGBA` /
+   `B_RGBA` alphas to `0.000`. No effect.
+2. `loading_freeplay.txt::image_track.ACTIVE = FALSE`. No effect.
+3. `backgrounds.txt::BG_RGBA` alpha `0`. No effect.
+4. Broad nuke: every `loading_*.txt` plus `pause_background.txt` set
+   to root-PANEL `ACTIVE FALSE`. No effect.
+5. `get_in_car_animation.txt` set to root-PANEL `ACTIVE FALSE`. No
+   effect.
+6. `get_in_car_animation.txt` made `0×0` offscreen with `CLIP TRUE`
+   and alpha `0`. No effect.
+7. `freeplay.ctl` Page entry `getincar.freeplay` commented out.
+   **Crash** — null-ptr read at `0x800285285` when the game tried to
+   navigate to that page.
+
+Reverted everything in 3.x once the file-open log confirmed the
+emulator was reading the overlay files (774+ newui panel reads in
+one session, every patched filename included).
+
+### What that rules out definitively
+
+- The overlay is not rendered through any `newui/panels/*.txt` file
+  we have touched — and we covered every fullscreen panel that a
+  search across the panel set identified (`WIDTH 192x` match, plus
+  the pre-race / get-in-car / loading family).
+- The `FreeplayGetInCar` controller (and its `TourGetInCar` /
+  `ChallengeGetInCar` siblings) ignore the panel's `ACTIVE` flag,
+  dimensions, RGBA alpha, and clip rect. Setting the panel to a
+  `0×0` sprite offscreen with alpha 0 had no visible effect on the
+  car render.
+- Removing the Page registry entry for `getincar.freeplay` crashes.
+  The page navigation graph is hard-required.
+- The dim layer is not `backgrounds.txt`, not `pause_background.txt`,
+  not a `loading_*` gradient, not a `vehicle_select_background`
+  gradient.
+
+### Where the overlay actually lives
+
+Given the sum of the evidence above, the car-image overlay and its
+accompanying dim layer are drawn by the `FreeplayGetInCar` controller
+(compiled C++ code inside the eboot), not by the UI panel system.
+The controller writes the 3D car render and the dim layer directly
+into the main HDR / composite scene target addresses we identified
+in earlier phases (`0x500cdd0000`, `0x5009688000`, `0x5008130000`,
+`0x500fdd0000`). The UI `.txt` panels for those pages are carriers
+for the page navigation graph, not the render surface.
+
+This is consistent with an "engine-driven UI" architecture where the
+declarative panel files define layout slots and the C++ controller
+fills them by talking directly to the renderer.
+
+### Dead ends attempted before escalation
+
+We already ruled out `sceVideoOutAdjustColor` / host gamma as the
+overlay carrier during Phase 4:
+
+> stubbing out the gamma write and forcing presenter gamma to stay at
+> `1.0` did not move the blackout
+
+and forcing `Finish()` around the race-start window also failed. So
+the "engine-side clear on gamma-pulse" hook that might look obvious
+from the gamma=0.5 race-start signal has already been tried in a
+different form and was a clean miss. There is no sceVideoOut-side
+lever left to pull from the emulator side.
+
+### Conclusion of the asset track
+
+The asset-side surface we can reach from `.rpk` and `newui/*.txt`
+patches is exhausted as far as this overlay is concerned. The
+controller that renders it is not reachable through any of those
+declarative files. The remaining escalation path is:
+
+- binary-patch the eboot to neutralize the `FreeplayGetInCar` render
+  path
+
+See the next section for the plan.
+
+## Phase 9 — eboot binary-patch plan
+
+### Target
+
+The `FreeplayGetInCar` controller class inside
+`/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003/eboot.bin`.
+Specifically: neutralize its render/update function so the page still
+navigates and transitions (page dictionary stays complete) but no 3D
+car and no dim layer are drawn while the page is active.
+
+Known facts from early recon (2026-04-21):
+
+- `eboot.bin` is 25 MB; `file` reports `data` (stripped / unrecognised
+  ELF variant — PS4 OELF, probably post-sceAuthEtcFromSelf decryption).
+- `FreeplayGetInCar` ASCII string is present twice in the binary.
+  Siblings `TourGetInCar`, `ChallengeGetInCar`, `GetInCar` also
+  present.
+- `readelf` / `objdump` / `nm` are available. Ghidra and radare2 are
+  not currently installed on this host; we will add one before doing
+  real disassembly work.
+
+### Approach
+
+1. **Install a disassembler** with PS4 OELF support. Shortlist in
+   preference order:
+   - `ghidra` (Arch: `pacman -S ghidra`) — de facto standard for
+     console RE; ships with a built-in OELF loader via community
+     plugins.
+   - `radare2` / `rizin` — lighter, script-friendly; OELF partial
+     support via `iaito` / plugins.
+   - As a last resort: parse the OELF segments by hand in Python,
+     feed the `.text` range to `capstone` (`pip install capstone`).
+
+2. **Find the controller's class/vtable** in two passes:
+   a. Locate the two ASCII occurrences of `FreeplayGetInCar` via
+      `grep -abo` on the raw file. Record file offsets.
+   b. In the disassembler, search for data-ref / LEA references to
+      those offsets. They will fall inside the controller registry /
+      class constructor. Follow to the class's virtual-method table.
+
+3. **Identify the render dispatch**. The controller vtable has a
+   handful of virtual methods; the one we want is the per-frame
+   render call that issues the 3D car draws + dim composite. Common
+   naming patterns: `Render`, `OnRender`, `Draw`, `OnDraw`,
+   `UpdateAndRender`. The method will dispatch into the engine's 3D
+   renderer (many sceGnm / graphics-module calls downstream).
+
+4. **Patch strategy**. Two variants to try in order of lowest risk:
+   a. Prologue RET — replace the first byte of the method with `0xC3`
+      (`ret`). The page is still active, timer still counts, but the
+      method is a no-op. If the method has a non-void return, we may
+      need to stub a return value (zero the return register before
+      the ret).
+   b. NOP the specific draw call — if prologue-RET breaks the flow
+      (hang / soft-lock), find the GNM draw dispatch inside the
+      method and replace its `call` instruction with NOPs of equal
+      length.
+
+5. **Apply safely**:
+   - Copy real `eboot.bin` into
+     `/mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/eboot.bin`
+     (replacing the current symlink).
+   - Keep the unpatched copy as `eboot.bin.vanilla` next to it.
+   - Patch the overlay copy byte-for-byte. Document every patched
+     offset in this doc and in a companion `eboot_patches.md`.
+
+6. **Verify**: launch via `scripts/run_driveclub_overlay.sh`, run a
+   Munnar 19:30 start, observe whether the overlay disappears while
+   the rest of the flow (page navigation, HUD, race start) is intact.
+
+### Rollback
+
+The overlay eboot lives only at
+`tmp/driveclub_overlay/CUSA00003/eboot.bin`. Deleting it and
+re-symlinking to the real install restores vanilla behaviour in one
+command. No destructive operation touches the installed game tree.
+
+### Risks
+
+- The controller may have more than one callsite that renders the
+  car (e.g. separate `Update` + `Render` method, or the render is
+  done by a child actor). First patch might be incomplete.
+- Driveclub's v1.28 eboot may have integrity checks. If a plain byte
+  patch causes the OELF to fail its internal signature check, we'll
+  see it as a launch-time refusal rather than a visual change.
+- Patching may break `TourGetInCar` / `ChallengeGetInCar` if those
+  share the same controller class via inheritance. Minor — we aren't
+  using tour / challenge modes in the repro.
+
+### Recon already completed (2026-04-21 end-of-session)
+
+Concrete data gathered, stored at
+`/mnt/data/Projects/shadPS4/tmp/eboot_extract/`:
+
+- `eboot.elf` — inner ELF carved out of the OELF at file offset
+  `0x120` (`OELF header = 32 B + 8 × 32 B segment descriptors`,
+  rounded to 16 B → 0x120).
+- `eboot.et_exec.elf` — same ELF with `e_type` flipped from
+  `ET_SCE_EXEC (0xFE10)` to `ET_EXEC (0x0002)` and OSABI from
+  `FreeBSD (0x09)` to `SYSV (0x00)` so GNU binutils and LLVM tools
+  accept it. Standard `objdump` still refuses (no section headers);
+  `llvm-objdump -d` works.
+
+ELF layout:
+
+| Segment | File offset | VA | File size | Flags |
+|---|---|---|---|---|
+| LOAD #0 (text + rodata) | `0x4000` | `0x0` | `0x1551ab8` | R E |
+| LOAD #1 (data) | `0x1558000` | `0x1554000` | `0x11be20` | RW |
+
+→ `file_off (text) = VA + 0x4000`.
+→ `file_off (data) = VA - 0x1554000 + 0x1558000 = VA + 0x4000`.
+
+String VAs (all in text segment):
+
+| String | VA | File offset (inner ELF) |
+|---|---|---|
+| `TourGetInCar` (×2) | `0x12c4041` / `0x12c4052` | `0x12c8041` / `0x12c8052` |
+| `FreeplayGetInCar` (×2) | `0x12c4848` / `0x12c485d` | `0x12c8848` / `0x12c885d` |
+| `ChallengeGetInCar` (×2) | `0x12c4c57` / `0x12c4c6d` | `0x12c8c57` / `0x12c8c6d` |
+
+The two `FreeplayGetInCar` strings are a 20-char
+`FreeplayGetInCarPage` followed by a 16-char `FreeplayGetInCar`
+(the page's class name and the controller's class name).
+
+Instructions that reference `FreeplayGetInCar` string VAs:
+
+| VA | Bytes | Instruction | Targets |
+|---|---|---|---|
+| `0xf89b60` | `48 8d 05 f6 ac 33 00` | `lea rax, [rip+0x33acf6]` | `0x12c485d` (controller name) |
+| `0xf89b70` | `48 8d 05 d1 ac 33 00` | `lea rax, [rip+0x33acd1]` | `0x12c4848` (page name) |
+
+Each is followed immediately by `c3` (`ret`) and padding NOPs. These
+are two virtual-method name-getter functions — standard Itanium
+RTTI accessors that return a pointer to the class's ASCII name.
+
+The constructor that writes the vtable pointer for this class is
+directly above them, at `VA 0xf89b00-0xf89b50`:
+
+```
+f89b39: lea rax, [rip+0x6528a0]   # = 0x15dc3e0
+f89b40: add rax, 0x10             # points to first vfn slot
+f89b44: mov [rbx], rax            # *this = vtable
+```
+
+Vtable lives at VA `0x15dc3e0` (file offset `0x15e03e0` inside the
+inner ELF, inside LOAD #1 data segment). Its function-pointer slots
+are zero or carry **SCE dynamic relocation encoded placeholders**:
+
+```
+vtable at VA 0x15dc3e0 / file 0x15e03e0:
+  +000  0000000000000000  (offset-to-top)
+  +008  0000000700000016  (RTTI ptr reloc)
+  +010  0000000000000000  vfn[0]
+  +018  0000000700000017  vfn[1]  (reloc, not an addr)
+  ... rest zero
+```
+
+The nonzero 8-byte values (`0x0000000700000016` etc.) are SCE
+relocation-record indices, not resolved function addresses. The
+static file does not carry the real virtual method addresses for
+`Render` / `OnDraw` / etc. — those are filled in by the dynamic
+linker at runtime.
+
+### What that means for the patch plan
+
+We cannot pre-compute the `FreeplayGetInCar::Render` file offset by
+reading the static ELF alone. Two viable paths from here:
+
+1. **Parse the SCE dynamic section** (DYNAMIC segment starts at file
+   offset `0x186e568`) to extract the relocation table and symbol
+   table, resolve the vtable slots to their intended target
+   addresses, and patch the render slot.
+   - Needs either a tool with SCE OELF support (Ghidra + PS4 plugin,
+     rizin + rz-pssl, or custom Python) or the shadPS4 loader code
+     itself extended to dump resolved relocations.
+
+2. **Patch the class constructor instead of the vtable**. The
+   constructor at `VA 0xf89b00` stores `0x15dc3e0 + 0x10` as the
+   vtable pointer in the object. If we change the source address to
+   a vtable that contains a NO-OP/RET stub for the render slot, any
+   virtual dispatch becomes a no-op. Requires either:
+   - a scratch region in the file to hold a fake vtable, or
+   - editing the existing vtable after dynamic linking, which is
+     equivalent to path 1.
+
+3. **Patch the RTTI name getter**. The name-getter at `VA 0xf89b60`
+   returns a pointer to the `FreeplayGetInCar` class name. If we
+   change the return string to point at a different class name that
+   the factory does not recognise, the registry lookup for the
+   `getincar.freeplay` page fails at controller-registration time,
+   and the page becomes unrenderable in the same way the
+   `comment-out-the-Page-entry` experiment did — which crashed the
+   game. Not viable.
+
+4. **Patch a downstream SCE-GNM draw dispatcher**. If we can find a
+   specific draw-state set or texture binding that only the
+   GetInCar controller path hits, we can NOP it. Requires full code
+   analysis. Same tooling requirement as path 1.
+
+### Recommended order of operations for next session
+
+1. **Install a real RE tool with PS4 OELF support.** Fastest option
+   likely `ghidra` from the Arch repos, plus the community
+   `ghidra-ps4-loader` plugin. Alternative: rizin with SCE plugins.
+   Either gives us proper relocation resolution and xref tracing.
+
+2. **Load `eboot.et_exec.elf` (or the original OELF if the plugin
+   can handle it) into the chosen tool.** Use the string VAs above
+   as anchor points. Find the class vtable at VA `0x15dc3e0` once
+   relocations are resolved. Identify the render method slot.
+
+3. **Patch the overlay eboot**, not the real install. Overlay path:
+   `/mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/eboot.bin`.
+   Current overlay is a symlink — break it and drop a patched copy.
+   Keep `eboot.bin.vanilla` beside it for one-step rollback.
+
+4. **Test via `scripts/run_driveclub_overlay.sh`.** Repro track:
+   Munnar 19:30 clear.
+
+### File-path cheatsheet for the binary-patch work
+
+```
+# Original OELF (read-only install)
+/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003/eboot.bin   (25 MB OELF)
+
+# Carved inner ELF (writable, for analysis)
+/mnt/data/Projects/shadPS4/tmp/eboot_extract/eboot.elf              (inner ELF, ET_SCE_EXEC, FreeBSD)
+/mnt/data/Projects/shadPS4/tmp/eboot_extract/eboot.et_exec.elf      (same, retyped to ET_EXEC + SYSV so
+                                                                      GNU/LLVM tools parse it)
+
+# Overlay eboot (write path for the patched binary)
+/mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/eboot.bin (currently symlinked to real install)
+```
+
+Everything above this line is asset-side; everything below will be
+byte-level patching of the eboot. No emulator source changes planned
+for this phase.
+
+## Resume point for next session
+
+Everything below this block is the smallest possible handoff. If
+nothing in Phase 8 or Phase 9 gets read above this, these steps
+still produce progress.
+
+### State on disk at pause (2026-04-21)
+
+- Track-pack patches applied to the overlay, all known safe:
+  `india_road_circuit_01_r.rpk` and `india_road_point_02_n.rpk` in
+  `/mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/data/leveldata/`
+  carry the Iteration-1 set (PostFXConfig inline scalars, prerace Fade
+  tracks, night→day LUT swap). Patcher source at
+  `tools/driveclub_asset_patch/`; rebuild with
+  `dotnet build -c Release` inside that directory.
+- UI overlay sub-tree: `tmp/driveclub_overlay/CUSA00003/newui/` is a
+  real directory with per-file symlinks into the install. All
+  Phase-8 panel patches were reverted back to symlinks at the end of
+  that phase; everything under `newui/` in the overlay currently
+  matches vanilla. `newui/pages/freeplay.ctl` is symlinked back.
+- Overlay `eboot.bin` is still a symlink to the real install; no
+  binary patch has been written to disk yet.
+- shadPS4 source: `SHADPS4_DC_TORTURE` sample-texture null probe is
+  still compiled in at
+  `src/video_core/renderer_vulkan/vk_rasterizer.cpp` but dormant
+  (env var not exported in the launcher). Leave it.
+- Investigation logs used during Phase 8 grepping:
+  `/mnt/data/distrobox/gaming/.local/share/shadPS4/log/shad_log.txt`.
+
+### One-liner sanity-check commands
+
+```
+# Overlay still wired correctly
+ls -la /mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/newui/panels \
+    | head -5
+# Should show: directory with symlinks back to real install.
+
+# Patched track rpks present
+ls -lh /mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/data/leveldata/india_*.rpk
+
+# Build still good
+/mnt/data/Projects/shadPS4/build/shadps4 --help >/dev/null && echo OK
+```
+
+### What next session starts with
+
+1. Install Ghidra on the Arch host:
+
+   ```
+   sudo pacman -S ghidra
+   ```
+
+   (Alternative: `rizin` / `rz-ghidra` for a lighter CLI path. Either
+   works. Ghidra GUI is faster to navigate xrefs.)
+
+2. Load the carved ELF:
+
+   ```
+   /mnt/data/Projects/shadPS4/tmp/eboot_extract/eboot.et_exec.elf
+   ```
+
+   Import as x86-64, no section headers. Ghidra's autoanalysis will
+   walk function bodies via the program headers.
+
+3. Jump to the four anchor points already located this session:
+
+   | Anchor | VA | What it is |
+   |---|---|---|
+   | `FreeplayGetInCar` class name string | `0x12c485d` | |
+   | `FreeplayGetInCarPage` page name string | `0x12c4848` | |
+   | RTTI name-getter returning class name | `0xf89b60` | |
+   | Class constructor (sets vtable pointer) | `0xf89b00` | |
+   | Class vtable (unresolved in static file) | `0x15dc3e0` | |
+
+4. In Ghidra, cross-reference from the string VAs. The
+   constructor at `0xf89b00` writes
+   `*(this) = &vtable[0] (VA 0x15dc3f0)`. Once Ghidra applies its
+   runtime relocation analysis, the vtable's function pointers
+   (`vfn[0..N]`) will display actual addresses instead of the
+   `0x000000070000001X` relocation placeholders we see in raw
+   bytes.
+
+5. Identify the render / draw slot. Expected names in the UI
+   controller base class: `Render`, `OnRender`, `Draw`, `OnDraw`,
+   `UpdateAndRender`. The dispatch almost certainly calls into
+   GNM (sceGnm*) draw-state setup. Confirm by checking the render
+   method calls into known graphics-driver import stubs.
+
+6. Apply the patch:
+
+   ```
+   # Break the overlay symlink and replace with a patched copy.
+   cp /mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003/eboot.bin \
+      /mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/eboot.bin.vanilla
+   rm /mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/eboot.bin
+   cp /mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003/eboot.bin \
+      /mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/eboot.bin
+   ```
+
+   Byte-patch the overlay eboot (not the `.vanilla` backup). First
+   patch to try: replace the first byte of the identified render
+   method with `0xC3` (`ret`). Remember the eboot has an OELF
+   wrapper: the 288-byte header means file offset of the patch
+   inside `eboot.bin` is `inner_ELF_file_offset + 288`.
+
+7. Test:
+
+   ```
+   /mnt/data/Projects/shadPS4/scripts/stop_driveclub_live.sh
+   /mnt/data/Projects/shadPS4/scripts/run_driveclub_overlay.sh
+   ```
+
+   Load Munnar at 19:30 clear, observe whether the static-car
+   overlay disappears while HUD / race flow stay intact.
+
+8. Rollback if anything goes wrong:
+
+   ```
+   rm /mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/eboot.bin
+   ln -s /mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003/eboot.bin \
+         /mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/eboot.bin
+   ```
+
+### What not to waste time on
+
+These have all been tried and produced clean misses. Do not retest
+without a new hypothesis.
+
+- Host gamma / `sceVideoOutAdjustColor` hook (Phase 4).
+- Forced `Finish()` at race-start window (Phase 4).
+- Any texture-null torture on sampled inputs during race draws
+  (Phase 7).
+- Any `newui/panels/*.txt` single-panel surgery: loading screens,
+  backgrounds, pause, vehicle_select_background, get_in_car_animation
+  (Phase 8).
+- Removing the `getincar.freeplay` Page entry from `freeplay.ctl`
+  (Phase 8 — crashes).
+- `SHADPS4_DC_TORTURE` env var enabled — sampled-input hypothesis
+  closed.
+
+### Exit memory
+
+Remember the durable rule (see global memory):
+`feedback_never_accept_as_is` — there is no "accept it" option. The
+race-start overlay is a bug we are working to kill, not a feature
+to live with. Binary-patching the eboot is the next hypothesis; if
+it fails, the next one will be found from whatever that failure
+teaches us.
+
 ## File / path cheatsheet
 
 ```
@@ -1603,7 +2125,407 @@ Current best hypothesis:
 - likely suspects inside that family are `TemporalFade`,
   `MasterBrightness`, luminance/exposure controls, colour-remap
   volumes, or a prerace-camera handoff that temporarily drives those
+
+## Munnar track-pack findings
+
+Primary repro track:
+
+- India `Munnar`, pack `india_road_point_02_n`
+- user repro settings: `19:30`, clear weather
+
+The Munnar pack is the first asset-side target that produced a stable,
+repeatable change in blackout behavior without breaking boot.
+
+### What is inside `india_road_point_02_n.rpk`
+
+The Munnar probe found these relevant resource families:
+
+- prerace camera level data:
+  - `india_road_point_02_n_prerace_cams`
+  - `preracecam_*`
+  - `new_preracecam_*`
+  - `track_preview`
+  - `WorldCamera_*`
+  - `CutsceneCamera_*`
+- postfx level data:
+  - `india_posteffects`
+  - `PostFXConfig_exterior`
+  - `PostFXConfig_interior`
+  - `PostFXConfig_helmet`
+- animation libraries:
+  - prerace camera animationlib from `india_road_point_02_n_prerace_cams.lvl`
+  - postfx animationlib from `india_common/india_posteffects.lvl`
+
+Most important new finding:
+
+- the prerace animationlib contains explicit sequences
+  `prerace_01` through `prerace_08`
+- those sequences carry animated `Fade` tracks with keyed values
+  ramping to `1.0`
+- this is the first concrete track-local blackout-style animation found
+  in the game assets
+
+Additional narrowing from the probe:
+
+- `india_posteffects` depends only on:
+  - `PostFXConfig_exterior`
+  - `PostFXConfig_interior`
+  - `PostFXConfig_helmet`
+  - one local animationlib (`0x0046EAB21E3CF9E7`)
+- the local postfx animationlib contains grading/exposure tracks such
+  as:
+  - `india_dc_grade_exterior`
+  - `india_dc_grade_interior`
+  - `SunElevation`
+  - `AutoTargetLuminance`
+  - `ManualExposureLog2`
+  - `ManualAutoMix`
+  - `AutoMaxLuminance`
+  - `AutoSpeed`
+  - `MasterBrightness`
+  - `MotionBlurLevel`
+  - `ColourRemapVolumeName`
+- this means the Munnar postfx branch is largely self-contained inside
+  the track pack; it does **not** obviously bind to `globaldata`
+  `FadeIn/FadeOut` sequences through the `india_posteffects` resource
+  itself
+
+### What was patched in the stable Munnar tests
+
+The track-local patch set that boots reliably included:
+
+- all actor `Fade` values zeroed for:
+  - `preracecam_*`
+  - `new_preracecam_*`
+  - `track_preview`
+  - `WorldCamera_*`
+  - `CutsceneCamera_*`
+- all `PostFXConfig_*` inline `TemporalFade = 0`
+- several other inline postfx scalar neutralizations
+- India night LUT references swapped to day LUTs
+- the prerace animationlib `Fade` tracks zeroed directly
+
+### What that changed at runtime
+
+This did **not** remove the blackout itself.
+
+What it changed reliably:
+
+- the image *under* the blackout stopped looking like the normal race
+  frame and instead latched the prior car / `Press X to start event`
+  screen
+- HUD stayed alive
+- game audio continued
+- mirror still went black during the blackout interval
+
+Current stable conclusion for the Munnar pack:
+
+- `india_road_point_02_n.rpk` controls what image gets latched or
+  persists under the blackout
+- it does **not** appear to own the blackout master switch itself
+- zeroing track-local camera fades and even the explicit prerace
+  animation `Fade` tracks is not enough to disable the blackout
+- the local postfx animationlib looks responsible for track-specific
+  exposure / grading, but not for the blackout master switch
+
+This is an important split:
+
+- track-local prerace assets affect the visible content under blackout
+- the blackout timing/switch likely lives in a shared layer above or
+  alongside the track pack
+
+## `globaldata.rpk` findings
+
+`globaldata.rpk` is the strongest shared asset candidate found so far,
+but it is too fragile to brute-patch broadly.
+
+### What is inside `globaldata.rpk`
+
+Direct string and probe inspection found:
+
+- shared transition tracks:
+  - `FadeIn`
+  - `FadeOut`
+  - `FadeIn_Fast`
+  - `FadeOut_Fast`
+- shared postfx transition tracks:
+  - `RTT_BLUR_ON`
+  - `RTT_BLUR_OFF`
+  - `RTT_GRADING_ON`
+  - `RTT_GRADING_OFF`
+- shared override actors:
+  - `PostFX_BloomOverride_*`
+  - `PostFX_ColourGradingOverride`
+- shared cutscene cameras
+
+This is exactly the kind of shared layer that could sit above both the
+main race view and the mirror/prerace handoff.
+
+Important limit from the track probe:
+
+- the `globaldata` string found inside `india_road_point_02_n.rpk`
+  appears in generic asset-path/provenance text alongside other pack
+  references such as `worlds/india_common.rpk`
+- it is **not** evidence that Munnar's `india_posteffects` directly
+  references `globaldata` fade sequences at runtime
+
+### What was tried
+
+Two classes of `globaldata` patches were attempted:
+
+1. broad shared patch
+   - touched fade sequences
+   - touched RTT blur/grading override tracks
+   - touched shared override actors
+2. fade-only patch
+   - touched only:
+     - `FadeIn`
+     - `FadeOut`
+     - `FadeIn_Fast`
+     - `FadeOut_Fast`
+
+### What happened
+
+Both classes were unstable at boot.
+
+Important correction discovered during testing:
+
+- one boot crash was caused by the overlay accidentally missing
+  `globaldata.rpk` entirely
+- after restoring the original file, the broad and fade-only
+  `globaldata` patches were still unstable enough that they are not
+  trustworthy runtime shotguns
+
+Current conclusion for `globaldata.rpk`:
+
+- it remains a plausible shared blackout layer
+- but it is **not** a safe brute-force patch target
+- broad or direct sequence edits there should be treated as fragile and
+  analysis-only until a much more surgical patching method exists
+
+## Asset-side takeaways so far
+
+What is now load-bearing:
+
+- track-local prerace/postfx assets are real and relevant
+- Munnar-local patches change the image latched under blackout
+- shared `globaldata` fade/transition content is a plausible master
+  layer
+
+What is now ruled out or deprioritized:
+
+- the idea that the blackout is purely in host present, host gamma, or
+  final output
+- the idea that track-local camera `Fade` alone owns the blackout
+- brute-force editing of `globaldata.rpk` as a safe runtime test path
+
+Recommended direction from this point:
+
+- keep `globaldata` at baseline while testing
+- use track-local packs like Munnar to understand what content is
+  carried under blackout
+- treat `globaldata` as a shared transition/analysis target, not as a
+  broad shotgun target
   values
+
+## India first-track deep dive
+
+The first India reverse track (`india_road_circuit_01_r.rpk`) is now the
+best concrete asset-side target because it matches the user's most
+reliable reproduction: long blackout at `19:30`, clear weather.
+
+### Resource split
+
+Using a local probe tool against
+`data/leveldata/india_road_circuit_01_r.rpk`:
+
+- `india_posteffects | RTUID_LEVEL_DATA`
+  - depends on:
+    - `EVO+LEVEL+ACTORPostFXConfig_interior`
+    - `EVO+LEVEL+ACTORPostFXConfig_exterior`
+    - `EVO+LEVEL+ACTORPostFXConfig_helmet`
+    - `animations | RTUID_ANIMATIONLIB`
+- `india_road_circuit_01_n_prerace_cams | RTUID_LEVEL_DATA`
+  - depends on:
+    - older `EVO+LEVEL+ACTORpreracecam_*`
+    - newer `EVO+LEVEL+ACTORnew_preracecam_*`
+    - `animations | RTUID_ANIMATIONLIB`
+    - `sequences | RTUID_ANIMATIONLIB`
+
+This gives a clean family split:
+
+- **prerace camera system**
+- **postfx/exposure system**
+- **animation libraries that can override both**
+
+### Older and newer camera actors
+
+The older `preracecam_*` actors identify themselves as `worldcam`.
+They expose inline scalar fields such as:
+
+- `VFoV`
+- `Fade`
+- `LookAt`
+- `LookAtOffset_X`
+- `LookAtOffset_Y`
+- `LookAtRoll`
+- `RelativeTo`
+- `RelativeToOffset`
+- `FocusDistance`
+- `DepthOfField`
+- `ShutterSpeed`
+- `ShakeEnabled`
+- `ShakeIntensity`
+
+The newer `new_preracecam_*` actors identify themselves as `cutsccam`.
+They expose:
+
+- `VFoV`
+- `Fade`
+- `LookAt`
+- `LookAtOffset_X`
+- `LookAtOffset_Y`
+- `LookAtRoll`
+- `Pivot`
+- `CameraInPivotSpace`
+- `FocusDistance2`
+- `ApertureFNumber`
+- `EnableNewDOF`
+- `AutoFocus`
+- `ShutterSpeed`
+- `ShakeEnabled`
+- `ShakeIntensity`
+
+The same inline `Fade` slot also exists on the India
+`CutsceneCamera_*` actor.
+
+### PostFXConfig actor fields are inline and patchable
+
+The `PostFXConfig_interior`, `PostFXConfig_exterior`, and
+`PostFXConfig_helmet` actor resources all share the same inline scalar
+layout. The relevant fields are not opaque references; their values sit
+directly in the actor blob.
+
+Shared defaults observed in all three actor resources:
+
+- `ManualExposureLog2 = -16`
+- `AutoTargetLuminance = 0.3612`
+- `ManualAutoMix = 1`
+- `AutoMaxLuminance = 300`
+- `AutoSpeed = 1`
+- `WeatherType = 0`
+- `WeatherOverrideMix = 1`
+- `MasterBrightness = 0.003`
+- `TemporalFade = 1`
+- `NonBloomedAttenuation = 1`
+- `Enabled = 1`
+- `TXAAOverallWeight = 0.7`
+- `TXAAColourClamping = 1`
+- `MotionBlurLevel = 0.2` exterior/helmet, `0.3` interior
+
+The only obvious string-level difference between the three postfx
+actors is the remap cube they point to:
+
+- exterior: `colourcuberemap_india_linear.dds`
+- helmet: `colourcuberemap_india_linear.dds`
+- interior: `colourcuberemap_india_interior_linear.dds`
+
+This is important because it means `TemporalFade` and the basic exposure
+controls can be brute-force patched directly without first solving a
+complex parser.
+
+### Animation libraries are likely overriding some darkness state
+
+The India postfx level depends on an `RTUID_ANIMATIONLIB` resource whose
+string table contains:
+
+- `india_dc_grade_interior`
+- `india_dc_grade_exterior`
+
+and the following animated property names:
+
+- `SunElevation`
+- `AutoTargetLuminance`
+- `ManualExposureLog2`
+- `ManualAutoMix`
+- `AutoMaxLuminance`
+- `AutoSpeed`
+- `MasterBrightness`
+- `MotionBlurLevel`
+- `ColourRemapVolumeName`
+
+This is a strong hint that the grade/exposure system is driven by a
+time-of-day or sun-elevation curve, not only by the inline defaults.
+
+Crucial negative result:
+
+- the postfx animation library does **not** show `TemporalFade`
+
+That creates a useful split:
+
+- likely **blackout transition** controls:
+  - prerace/cutscene camera `Fade`
+  - postfx `TemporalFade`
+- likely **scene remains too dark after fade lifts** controls:
+  - `india_dc_grade_exterior`
+  - `india_dc_grade_interior`
+  - exposure/brightness/remap curves
+
+### Camera animation library also contains Fade tracks
+
+The prerace animation library contains named tracks for both the older
+and newer camera families. For the older `prerace_*` tracks, it clearly
+contains:
+
+- `Time`
+- `Transform`
+- `Transition`
+- `VFoV`
+- `Fade`
+
+The newer `new_preracecam_*` tracks expose rotation/translation/VFoV and
+camera-focus fields. The string dump does not clearly show a `Fade`
+track for every new camera, but the actor still contains the inline
+`Fade` field, so the prerace handoff can still depend on it.
+
+### Practical interpretation
+
+The current best model is now a two-layer one:
+
+1. a prerace/postfx transition gate is temporarily darkening or gating
+   visibility (`Fade`, `TemporalFade`)
+2. when that gate relaxes, the underlying India exterior grade can still
+   make the scene much too dark at the tested evening time
+
+This matches the user's repeated observation that the race can begin
+with a true fade-to-black phase and then reveal a scene that is still
+wrongly dark underneath.
+
+### First asset-side brute-force patch set
+
+A dedicated local tool (`tools/driveclub_asset_patch`) was added to
+generate patched copies of the India track pack without touching the
+installed game file.
+
+The first brute-force patch set does all of this at once:
+
+- zero every prerace/cutscene camera `Fade`
+- zero every `PostFXConfig_*` `TemporalFade`
+- neutralize several inline postfx scalars:
+  - `MasterBrightness = 1`
+  - `ManualExposureLog2 = 0`
+  - `ManualAutoMix = 0`
+  - `WeatherOverrideMix = 0`
+  - `MotionBlurLevel = 0`
+- force the postfx animation library's night LUT references back to the
+  day LUTs:
+  - `colourcuberemap_india_interior_night_linear.dds` ->
+    `colourcuberemap_india_interior_linear.dds`
+  - `colourcuberemap_india_night_linear.dds` ->
+    `colourcuberemap_india_linear.dds`
+
+This is the first non-renderer brute-force that actually targets
+concrete prerace/postfx content associated with the India blackout.
 
 ## External tooling / level inspection
 

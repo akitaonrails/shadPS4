@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="/mnt/data/Projects/shadPS4"
 BIN="/mnt/data/Projects/shadPS4/build/shadps4"
 EBOOT="/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003/eboot.bin"
 PIDFILE="${DRIVECLUB_PIDFILE:-/mnt/data/Projects/shadPS4/tmp/driveclub-live.pid}"
+STOP_SCRIPT="${ROOT}/scripts/stop_driveclub_live.sh"
 
 if [[ ! -x "$BIN" ]]; then
   printf 'ERROR: binary missing: %s\n' "$BIN" >&2
@@ -16,6 +18,9 @@ fi
 
 mkdir -p "$(dirname "$PIDFILE")"
 rm -f "$PIDFILE"
+
+# Enforce a single live emulator session before every launch.
+"$STOP_SCRIPT" >/dev/null 2>&1 || true
 
 exec distrobox-enter gaming -- sh -lc '
   pidfile="$1"
