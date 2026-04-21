@@ -723,6 +723,141 @@ binary through the gamma-debug QtLauncher entry:
    documenting it here for any future Driveclub guide on the
    compatibility repo.
 
+## Race-start blackout (2026-04-20 follow-up)
+
+### Symptom
+
+Separate from the earlier SDR/brightness chase: at the start of a race,
+the world layer would sometimes fade almost to black while the HUD
+remained fully visible. Day tracks sometimes recovered after 5-10
+seconds; dusk could stay black for 30+ seconds or never come back.
+
+### What the probes ruled out
+
+- Not final present / post-process: timed "game-only" screenshots showed
+  the raw guest image already black.
+- Not `sceVideoOutAdjustColor` gamma: forcing a neutral
+  `SHADPS4_VIDEOOUT_GAMMA_OVERRIDE=1.0` did not change the behaviour.
+- Not `ResolveDepthOverlap`, degamma, min/max blend, or predication:
+  dedicated logging for those paths stayed quiet during the blackout.
+
+### What the probes showed
+
+The useful signal came from instrumenting the `1920x1080` non-video-out
+scene targets and then the texture cache itself:
+
+- `0x5009688000` (`B10G11R11UfloatPack32`) is the main suspect target.
+- During blackouts, that target repeatedly dropped to near-zero while
+  sibling float targets such as `0x5008130000` / `0x500fdd0000` stayed
+  populated.
+- `TextureCache::FindImage()` / `ExpandImage()` showed repeated same-address
+  churn on `0x5009688000`:
+  create new image -> `ExpandImage()` -> `CopyImage()` from
+  `0x5009688000` to `0x5009688000` -> reselect via `used_overlap=true`.
+
+That pattern points to a generic texture-cache alias/recreation bug, not
+a Driveclub-specific post-process quirk. Driveclub is just a very visible
+repro because its scene pipeline is sensitive to losing the HDR-like world
+buffer for even a few frames.
+
+### Experimental fix in `gamma-debug`
+
+`TextureCache::ExpandImage()` previously did this unconditionally:
+
+1. create the replacement image
+2. `RefreshImage(new_image)` from CPU memory
+3. `CopyImage(src_image)` from the old GPU image
+
+For same-address GPU render targets, step 2 is likely wrong: the CPU-side
+backing for that guest address is stale or zero, while the live contents
+exist only in the GPU render target. The branch now skips the CPU refresh
+when all of these are true:
+
+- same guest address
+- source image is/was a render target
+- source image `SafeToDownload()` (GPU contents authoritative)
+
+In that path the expanded image now preserves GPU-authored contents,
+inherits the old usage bits, and carries `GpuModified` forward.
+
+### Expected effect
+
+If the diagnosis is right, the race-start blackout should become stable or
+disappear entirely, especially on dusk tracks. The expected win is not
+"brighter output"; it is keeping the world render target from being
+recreated out from under the game.
+
+### Follow-up: equal-address variants were still diverging
+
+The first `ExpandImage()` preservation fix was not enough on its own.
+Later probes showed two more details:
+
+- `ResolveOverlap()` was still freeing expanded same-address variants on
+  the `equal-address incompatible block` path, even though the guest
+  address / format / tile mode matched and Driveclub was just rebinding
+  the same target with different resource shapes (`1/1`, `9/1`, `10/1`,
+  `11/1`).
+- After preserving those variants, `FindImage()` could still hand back
+  the smaller exact-size image, while a larger compatible same-address
+  image already existed in the cache.
+
+That second point matters because these are separate Vulkan images. If a
+smaller `1/1` image is selected for one pass and the larger `11/1`
+image is selected for a later pass, their contents diverge even though
+they represent the same guest memory. That gives exactly the kind of
+intermittent "world goes black, HUD survives" behaviour seen in
+Driveclub.
+
+Current `gamma-debug` branch status:
+
+- same-address mip/resource-shape variants are preserved instead of
+  immediately freed when the format / type / tile mode stay compatible
+- `FindImage()` now prefers the largest compatible same-address image as
+  the canonical backing image for subsequent lookups
+
+This keeps the cache from bouncing between multiple independent Vulkan
+images for `0x5009688000` and related scene targets.
+
+### Follow-up: later composite stage and bundled shader-input probe
+
+Subsequent traces weakened the "main HDR target cache churn" theory as
+the sole cause. The stronger pattern became:
+
+- the later `1920x1080` `RGBA8 sRGB` scene target at `0x500cdd0000`
+  goes black during the race-start blackout
+- larger upstream scene buffers can stay populated at the same time
+- the recurring in-race composite shader for that target is
+  `fs_hash=0x1b0d793e`
+- that shader repeatedly samples a few small inputs, most notably:
+  - `0x505fdf4800` `BC6HUfloat` `128x128`
+  - `0x505ff45200` `BC6HUfloat` `256x1024`
+  - `0x505fe57600` `R8G8B8A8Unorm` `512x256`
+
+Importantly, those smaller sampled inputs did **not** show the same
+free/recreate/overlap churn that `0x5009688000` showed earlier. They
+were created once and then reused normally. That pushed suspicion away
+from a second texture-cache lifetime bug and toward content correctness
+inside the composite stage itself.
+
+To accelerate the next round of testing, the `gamma-debug` branch now
+contains a bundled visual probe in `vk_rasterizer.cpp`:
+
+- only when drawing to `0x500cdd0000`
+- only for fragment shader `0x1b0d793e`
+- sampled inputs at the three addresses above are substituted with
+  1x1 solid debug textures
+  - `0x505fdf4800` → bright red
+  - `0x505ff45200` → bright green
+  - `0x505fe57600` → bright blue
+
+The point of this probe is not to "fix" Driveclub. It is to make the
+composite stage fail loudly and directionally, so one run can answer
+multiple questions at once:
+
+- does the blackout path actually depend on those small sampled inputs?
+- which substituted input dominates the visible result?
+- does replacing them change the blackout shape, duration, or recovery?
+
 ## Upstream candidates
 
 Code that is clean enough to feed back to `shadps4-emu/shadPS4` once the
@@ -739,6 +874,326 @@ experiment is validated:
 
 Everything else in this branch is scoped to the investigation and wouldn't
 be upstreamed as-is.
+
+## Handoff status (2026-04-20, late)
+
+This section is the current state after several more hours of probing on
+`gamma-debug`. It supersedes the earlier optimism around one specific
+surface fix.
+
+### The hard conclusions
+
+- The race-start blackout is **not**:
+  - final present / swapchain gamma
+  - `sceVideoOutAdjustColor`
+  - QtLauncher / host display output
+  - degamma / min-max blend / predication
+- It is inside the game's **internal scene HDR / composite path**.
+- HUD staying correct while the world blacks out is a stable discriminator:
+  the UI path is fine; the world-composite branch is not.
+
+### The key full-res surfaces
+
+These are the only targets that kept mattering in every useful run:
+
+- `0x500cdd0000` — `1920x1080` `R8G8B8A8Srgb`
+  - visible world composite target
+  - this is the thing that visibly goes black
+- `0x5009688000` — `1920x1080` `B10G11R11UfloatPack32`
+  - main HDR-like scene branch
+- `0x5008130000` — `1920x1080` `B10G11R11UfloatPack32`
+  - alternate HDR-like scene branch
+- `0x500fdd0000` — `1920x1080` `B10G11R11UfloatPack32`
+  - another HDR-like temporal/composite branch
+- `0x500ddc0000` — `1920x1080` `R8Srgb`
+  - auxiliary visible/mask branch that often stays alive
+- `0x50105c8000` — `1920x1080` `R16G16Sfloat`
+  - another stable scene-side intermediate
+
+### What the stats now say
+
+Across repeated clean baseline runs:
+
+- `0x500cdd0000` repeatedly drops to zero during the blackout.
+- `0x5009688000` often drops with it, but not always at the exact same
+  moment.
+- `0x5008130000` sometimes stays alive while `0x500cdd0000` is black,
+  and sometimes later also dies.
+- `0x500fdd0000` frequently stays healthy and can even become brighter
+  while the visible target is black.
+- `0x500ddc0000` and `0x50105c8000` often stay alive through the
+  blackout.
+
+That means the bug no longer looks like "one buffer dies and takes the
+rest with it". It looks more like a broken handoff or dependency between
+multiple HDR branches before the final visible composite.
+
+### What the aggressive probes accomplished
+
+The aggressive phase was still useful, even though it did not produce a
+fix:
+
+- Freezing `0x500cdd0000` changed the symptom immediately.
+  - That proved it is on the critical visible path.
+  - But freezing it mostly produced a stale full-screen world plate with
+    HUD still updating on top.
+- Freezing HDR branches (`0x5009688000`, `0x5008130000`, `0x500fdd0000`)
+  also produced static-world / stale-plate symptoms.
+  - That proved those surfaces are temporal/history/composite feeders.
+  - But it stopped being diagnostic after a point, because "static
+    postcard" only means "we pinned a temporal HDR branch", not which
+    pass is actually wrong in the real unfrozen run.
+- Broad compute sabotage proved the correct subsystem:
+  destroying the compute-heavy scene branch killed the world while the
+  HUD survived.
+  But single-hash and small-group sabotage did not isolate a culprit
+  reliably.
+
+### What we tried and should stop retrying blindly
+
+- Surface freeze as the primary diagnostic.
+  - It has reached diminishing returns.
+  - It keeps proving "temporal HDR branch" without telling us which
+    *live* pass is the real source of the blackout.
+- Early hot-path skip experiments on draw/dispatch writers.
+  - Multiple attempts caused boot-time GPU crashes before any useful
+    race data was collected.
+- Small sampled-input substitution on the `0x500cdd0000` composite path.
+  - The substitutions failed technically as an isolator and never
+    produced a clean directional result.
+
+### Current baseline on `gamma-debug`
+
+As of this handoff, the branch is back to a **plain non-freeze,
+non-sabotage, booting baseline** with the useful passive stats still in
+place:
+
+- `SceneFreezeMode` is effectively `none`
+- `scene-sabotage` is `none`
+- the build boots and reproduces the real behaviour again
+- the world blacks out for 20+ seconds and then returns, matching
+  vanilla baseline
+
+### The fastest reasonable next step
+
+Do **not** go back to more surface-freeze variants first.
+
+The next probe should be:
+
+1. **Passive**
+   - no skipped draws
+   - no frozen surfaces
+   - no writer sabotage
+2. **Late-start**
+   - arm only after the visible world has been healthy for a short
+     stable window
+3. **Restricted to the full-res HDR/visible branch**
+   - `0x500cdd0000`
+   - `0x5009688000`
+   - `0x5008130000`
+   - `0x500fdd0000`
+   - `0x500ddc0000`
+   - `0x50105c8000`
+4. **Sequence-oriented**
+   - capture the exact pass order and shader hashes during the
+     transition from healthy frame -> blackout frame
+   - ideally with a slightly longer logging window than the previous
+     late-start trace attempt
+
+The current best hypothesis is:
+
+- not "one bad output gamma path"
+- not "one dead sampled texture"
+- not "one buffer always dies first"
+- but a broken transition inside the full-res HDR composite/exposure/
+  history chain before `0x500cdd0000`
+
+That is where the next round should spend its budget.
+
+## Phase 7 — aggressive torture probe (post-codex)
+
+Picking up after the late-2026-04-20 codex handoff. All of codex's
+`src/` changes were stashed (`git stash list` will show them labelled
+`codex probe scaffolding 2026-04-20`) so the tree is clean except
+for the doc itself. The torture hook below was built from scratch on
+`vk_rasterizer.cpp::BindTextures`.
+
+### Mechanism
+
+Env var `SHADPS4_DC_TORTURE=1`. When any draw writes to one of the
+four critical HDR/visible surfaces —
+
+```
+0x500cdd0000 1920x1080 R8G8B8A8Srgb          visible composite
+0x5009688000 1920x1080 B10G11R11UfloatPack32 HDR main
+0x5008130000 1920x1080 B10G11R11UfloatPack32 HDR alt primary
+0x500fdd0000 1920x1080 B10G11R11UfloatPack32 HDR alt composite
+```
+
+— the second pass of `BindTextures` null-substitutes specific sampled
+inputs before the descriptor write. Per-substitution logging is
+rate-limited to one line per unique (dst, src-addr, dims, format)
+tuple, tagged `[dc-torture]`. No freeze, no sabotage, no shader
+replacement — one-vector experiment only.
+
+### Run 1 — substitute every sampled input < 1024×1024 on matching draws
+
+Result: **main world pitch black, HUD intact, world visible in the
+car's mirror**. 370 unique substitutions, dominated by BC1/BC3/BC5/
+BC7 material textures (74 BC5, 71 BC1, 65 BC7, …).
+
+Takeaway: I nulled every material texture for every geometry pass
+that writes to the critical targets. Cars, track, sky had no diffuse
+/ normal / AO — of course they drew black. Misframed as a "composite"
+bug; these targets actually receive direct material-shaded geometry
+passes. The mirror surviving was not a real signal — see below.
+
+### Run 2 — same, but skip BC-compressed formats
+
+Result: **main world pitch black, HUD intact, mirror also black.**
+58 unique substitutions, all non-BC. Format histogram:
+
+```
+ 12 R32Uint                8x4  tile lighting index buffers  (many)
+ 10 R16G16B16A16Sfloat     various
+  8 R8Unorm                32x32
+  6 B10G11R11UfloatPack32  various
+  4 R32Sfloat              at 0x500c4d0000 at 3 different sizes
+  4 R8G8B8A8Srgb           256x256 textures
+  2 R32G32B32A32Sfloat     80x48 and 364x276 — tile luma grids?
+  1 D32Sfloat               960x540 — half-res depth
+```
+
+Also killed: ten half-res 960×540 buffers (SSR/bloom/temporal
+pyramid), mirror RT candidate `0x505fe57600 512x256 R8G8B8A8Unorm`,
+and the `0x500c4d0000 R32Sfloat` cascaded shadow/hierarchical depth
+at three mip sizes.
+
+Mirror visible in Run 1 was therefore a coincidence of BC-null
+rendering: when cockpit BC materials were nulled they shaded flat
+black, but shader discards keyed on `texture(bc).a` with null
+textures returning 1.0 meant alpha tests didn't clip, and the
+mirror-mesh region let whatever was drawn before show through.
+Not a real rendering path. Dismiss.
+
+Takeaway: the R32Uint `8×4` buffers are almost certainly forward+
+per-tile light lists — zeroing them means "no light affects any
+tile" which alone would black out most of the scene. The four
+`32×32 R16G16B16A16Sfloat` buffers at `0x5008130000` inputs look
+like ambient / irradiance probe grids. And the half-res pyramid is
+clearly needed for post-process.
+
+### Run 3 — substitute only `0x501d630000 80×48 R32G32B32A32Sfloat`
+
+The 80×48 R32G32B32A32 buffer has the exact shape of a per-tile
+luma grid feeding HDR eye-adaptation. Isolated this as the only
+torture target.
+
+Result: **scene renders normally, race-start fade still present and
+visually identical to baseline**. One substitution fired and was
+logged. Everything else on screen behaved as usual.
+
+Takeaway: this buffer — the strongest-shaped candidate for the
+adaptation input — doesn't drive the fade. Not conclusive for all
+small textures, but reduces the space of plausible single-texture
+culprits.
+
+### Run 4 — substitute eight small non-BC candidates
+
+Tortured all of:
+
+```
+0x501d630000 80x48   R32G32B32A32Sfloat
+0x501df20000 364x276 R32G32B32A32Sfloat
+0x50ba598400 128x2   R16G16B16A16Sfloat   — odd-shape histogram?
+0x5003896400 32x32   R8G8B8A8Unorm
+0x5065f2dc00 32x32   R16G16B16A16Sfloat   — probe
+0x5065f2bc00 32x32   R16G16B16A16Sfloat   — probe
+0x5065f31c00 32x32   R16G16B16A16Sfloat   — probe
+0x50239c0000 32x32   R16G16B16A16Sfloat   — probe
+```
+
+Result: **scene pitch black, HUD only, mirror black**.
+
+7 of the 8 substitutions fired (`0x501df20000` didn't rebind during
+this run). The black scene identifies the four 32×32 R16G16B16A16
+buffers as the ambient-probe grids responsible for ambient
+illumination — kill them and the scene has zero non-direct lighting
+and draws as black.
+
+Takeaway: these probes are essential for any visible scene.
+Confirmed as ambient/irradiance grids, not adaptation feedback.
+
+### Run-family conclusion for the texture-sampling hypothesis
+
+Across 4 torture runs the only configuration that produced a
+visible scene showed **the race-start fade unchanged**. I can't
+prove the fade is feedback-driven by a small sampled texture,
+because I only tested one candidate in isolation (80×48). But the
+stronger result is negative: the class of plausibly-shaped inputs
+(tile-averaged HDR float grids, 32×32 probe-shaped, small HDR
+histograms) either doesn't affect the fade or kills the scene
+entirely.
+
+The fade persisting regardless of sampled-texture torture means the
+driving signal is either:
+
+1. a push-constant / SGPR scalar pushed per-draw by the game
+2. a uniform buffer whose contents ramp over time
+3. a shader-intrinsic time-based computation reading game time
+
+None of those are reachable from texture-binding substitution.
+
+### Variability signal — the part I was wrong about
+
+Initially I claimed the fade duration looked "shorter on this tree
+than during codex's runs" and offered that as evidence the codex
+changes might have worsened it. That was wrong.
+
+**Fade duration is highly variable and non-correlatable**: under
+10 seconds on some race starts, ~20 seconds on others, 30+ seconds
+sometimes, and occasionally never recovers. Same build, same track,
+same time of day. No observed correlation with anything reproducible.
+
+The "never came back" case is the load-bearing signal. Scripted
+cinematic fades have fixed durations and always complete; a loop
+that sometimes fails to converge is inconsistent with "scripted
+animation" and more consistent with:
+
+- a feedback integrator whose input can get stuck at zero
+- a ping-pong buffer pair with cache aliasing (codex's own line
+  of investigation on `0x5009688000` create→ExpandImage→CopyImage
+  churn)
+- an async streaming / cache-warmup race that sometimes lands OK
+  and sometimes traps
+
+This re-opens the feedback-loop hypothesis but via a mechanism
+that texture-null torture cannot falsify — the emulator cache state
+itself is what's varying.
+
+### What to try next (no more "accept and move on")
+
+1. **Solid-white substitute** on the same four 32×32
+   R16G16B16A16Sfloat probe-candidates instead of null. If the
+   scene becomes blown-out-bright (as expected when ambient probes
+   are set to white) but the fade changes shape or disappears,
+   something in the adaptation chain is reading one of them.
+2. **Per-frame binding log** for draws into `0x500cdd0000` during
+   the first 15 seconds of a race. Look for a binding whose address
+   flips between two values each frame (ping-pong) vs. one that
+   stays put — mismatch would show the cache-alias bug codex saw.
+3. **Push-constant / UBO torture** — intercept the uniform-buffer
+   write path for draws to the critical targets, stomp the first
+   N floats to 1.0, observe whether the fade disappears. This is
+   the natural next vector once texture-null is exhausted.
+4. **Codex's `ExpandImage` / `FindImage` same-address preservation**
+   (currently stashed) — re-apply and re-test under the variability
+   lens. If the handoff was already addressing the aliasing but the
+   tests weren't repeated enough to see the variability, the change
+   may be a real fix masked by the non-determinism.
+
+The texture-sampling torture track is closed. The next probe vector
+must reach either game uniform data or the cache-aliasing path.
 
 ## File / path cheatsheet
 
