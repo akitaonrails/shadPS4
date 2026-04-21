@@ -40,6 +40,36 @@ def parse_args() -> argparse.Namespace:
         default=1200,
         help="Delay after device creation so SDL can discover the virtual pad",
     )
+    parser.add_argument(
+        "--pre-delay-ms",
+        type=int,
+        default=0,
+        help="Extra delay before the first replayed input event",
+    )
+    parser.add_argument(
+        "--hold-ms",
+        type=int,
+        default=3000,
+        help="Keep the virtual pad alive after replay so the emulator can finish processing",
+    )
+    parser.add_argument(
+        "--tail-confirm-count",
+        type=int,
+        default=0,
+        help="Append this many BTN_SOUTH confirm taps after the recording finishes",
+    )
+    parser.add_argument(
+        "--tail-confirm-delay-ms",
+        type=int,
+        default=2000,
+        help="Delay before the first appended confirm tap and between appended taps",
+    )
+    parser.add_argument(
+        "--tail-confirm-hold-ms",
+        type=int,
+        default=90,
+        help="Hold time for each appended confirm tap",
+    )
     return parser.parse_args()
 
 
@@ -80,6 +110,18 @@ def write_event(fd: int, ev_type: int, code: int, value: int) -> None:
     fd_write(fd, INPUT_EVENT.pack(0, 0, ev_type, code, value))
 
 
+def write_syn(fd: int) -> None:
+    write_event(fd, EV_SYN, SYN_REPORT, 0)
+
+
+def tap_key(fd: int, code: int, hold_ms: int) -> None:
+    write_event(fd, EV_KEY, code, 1)
+    write_syn(fd)
+    time.sleep(max(hold_ms, 0) / 1000.0)
+    write_event(fd, EV_KEY, code, 0)
+    write_syn(fd)
+
+
 def main() -> int:
     args = parse_args()
     payload = json.loads(args.recording.read_text())
@@ -107,6 +149,11 @@ def main() -> int:
         os.write(fd, packed)
         fcntl.ioctl(fd, UI_DEV_CREATE)
         time.sleep(args.settle_ms / 1000.0)
+        if args.pre_delay_ms > 0:
+            print(
+                f"[pad-replay] device ready, waiting {args.pre_delay_ms}ms before playback"
+            )
+            time.sleep(args.pre_delay_ms / 1000.0)
 
         start = time.monotonic()
         prev_dt = 0.0
@@ -125,6 +172,19 @@ def main() -> int:
             f"[pad-replay] replayed {len(events)} events over {total:.3f}s "
             f"from {args.recording}"
         )
+        if args.tail_confirm_count > 0:
+            print(
+                "[pad-replay] appending "
+                f"{args.tail_confirm_count} confirm taps "
+                f"every {args.tail_confirm_delay_ms}ms"
+            )
+            for idx in range(args.tail_confirm_count):
+                time.sleep(args.tail_confirm_delay_ms / 1000.0)
+                tap_key(fd, 304, args.tail_confirm_hold_ms)
+                print(f"[pad-replay] appended confirm {idx + 1}/{args.tail_confirm_count}")
+        if args.hold_ms > 0:
+            print(f"[pad-replay] holding virtual pad for {args.hold_ms}ms")
+            time.sleep(args.hold_ms / 1000.0)
         return 0
     finally:
         try:
