@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
+
 #include "common/debug.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -19,6 +25,103 @@
 #endif
 
 namespace Vulkan {
+
+namespace {
+
+// Driveclub torture probe. Enable with env SHADPS4_DC_TORTURE=1.
+// For draws whose color attachments target one of the critical full-res
+// HDR/composite surfaces, substitute specific sampled source textures with
+// a null binding. The goal is to isolate the in-game eye-adaptation /
+// luma-history feedback that drives the race-start fade by nulling one
+// suspect source at a time and observing which one shifts the fade.
+//
+// Current target: the 80x48 R32G32B32A32Sfloat buffer at 0x501d630000 — its
+// aspect ratio matches a per-tile luma-average grid, which is the classic
+// source shape for HDR eye adaptation.
+constexpr std::array<VAddr, 8> kTortureSourceAddrs{
+    0x501d630000ull, // 80x48 R32G32B32A32Sfloat  — luma per-tile grid
+    0x501df20000ull, // 364x276 R32G32B32A32Sfloat — medium luma grid
+    0x50ba598400ull, // 128x2 R16G16B16A16Sfloat   — odd-shape HDR (histogram?)
+    0x5003896400ull, // 32x32 R8G8B8A8Unorm        — tiny lookup
+    0x5065f2dc00ull, // 32x32 R16G16B16A16Sfloat   — probe-grid
+    0x5065f2bc00ull, // 32x32 R16G16B16A16Sfloat   — probe-grid
+    0x5065f31c00ull, // 32x32 R16G16B16A16Sfloat   — probe-grid
+    0x50239c0000ull, // 32x32 R16G16B16A16Sfloat   — probe-grid
+};
+
+constexpr std::array<VAddr, 4> kTortureRenderTargets{
+    0x500cdd0000ull, // 1920x1080 R8G8B8A8Srgb  visible composite target
+    0x5009688000ull, // 1920x1080 B10G11R11UfloatPack32 HDR main branch
+    0x5008130000ull, // 1920x1080 B10G11R11UfloatPack32 HDR alt primary
+    0x500fdd0000ull, // 1920x1080 B10G11R11UfloatPack32 HDR alt composite
+};
+
+bool IsTortureEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_TORTURE");
+        const bool on = env != nullptr && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "[dc-torture] enabled (SHADPS4_DC_TORTURE=1)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+bool IsCompressedBC(vk::Format fmt) {
+    switch (fmt) {
+    case vk::Format::eBc1RgbUnormBlock:
+    case vk::Format::eBc1RgbSrgbBlock:
+    case vk::Format::eBc1RgbaUnormBlock:
+    case vk::Format::eBc1RgbaSrgbBlock:
+    case vk::Format::eBc2UnormBlock:
+    case vk::Format::eBc2SrgbBlock:
+    case vk::Format::eBc3UnormBlock:
+    case vk::Format::eBc3SrgbBlock:
+    case vk::Format::eBc4UnormBlock:
+    case vk::Format::eBc4SnormBlock:
+    case vk::Format::eBc5UnormBlock:
+    case vk::Format::eBc5SnormBlock:
+    case vk::Format::eBc6HUfloatBlock:
+    case vk::Format::eBc6HSfloatBlock:
+    case vk::Format::eBc7UnormBlock:
+    case vk::Format::eBc7SrgbBlock:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool CurrentDrawHitsTortureTarget(const AmdGpu::Regs& regs) {
+    if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable) {
+        return false;
+    }
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col_buf = regs.color_buffers[cb];
+        if (!col_buf) {
+            continue;
+        }
+        const VAddr addr = col_buf.Address();
+        if (std::ranges::find(kTortureRenderTargets, addr) != kTortureRenderTargets.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void LogTortureSubOnce(VAddr dst_addr, VAddr src_addr, u32 w, u32 h, vk::Format fmt) {
+    static std::mutex seen_mutex;
+    static std::unordered_set<u64> seen;
+    const u64 key = static_cast<u64>(src_addr) ^ (static_cast<u64>(w) << 44) ^
+                    (static_cast<u64>(h) << 28) ^ static_cast<u64>(fmt);
+    std::lock_guard lock{seen_mutex};
+    if (seen.insert(key).second) {
+        LOG_INFO(Render_Vulkan, "[dc-torture] sub dst={:#x} src={:#x} {}x{} fmt={}", dst_addr,
+                 src_addr, w, h, vk::to_string(fmt));
+    }
+}
+
+} // namespace
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -720,8 +823,31 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     // Second pass to re-bind images that were updated after binding
+    const bool torture_active =
+        IsTortureEnabled() && CurrentDrawHitsTortureTarget(liverpool->regs);
+    VAddr torture_dst_addr = 0;
+    if (torture_active) {
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& col_buf = liverpool->regs.color_buffers[cb];
+            if (col_buf && std::ranges::find(kTortureRenderTargets, col_buf.Address()) !=
+                               kTortureRenderTargets.end()) {
+                torture_dst_addr = col_buf.Address();
+                break;
+            }
+        }
+    }
     for (auto& [image_id, desc] : image_bindings) {
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        if (torture_active && image_id && !is_storage) {
+            const auto& probe_image = texture_cache.GetImage(image_id);
+            if (std::ranges::find(kTortureSourceAddrs, probe_image.info.guest_address) !=
+                kTortureSourceAddrs.end()) {
+                LogTortureSubOnce(torture_dst_addr, probe_image.info.guest_address,
+                                  probe_image.info.size.width, probe_image.info.size.height,
+                                  probe_image.info.pixel_format);
+                image_id = {};
+            }
+        }
         if (!image_id) {
             if (instance.IsNullDescriptorSupported()) {
                 image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
