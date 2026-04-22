@@ -1349,6 +1349,88 @@ bool GetDcUboSmashOnlyRead() {
 // Returns true if a write happened (caller should then invalidate the
 // buffer_cache range so the Vulkan UBO actually picks up the dirty
 // bytes on the next ObtainBuffer).
+// Driveclub tonemap exposure intercept. Phase 23.
+//
+// The tonemap compute pipeline 0x000002c995517e7f reads its
+// per-frame exposure scalar from ssbo_5 at offset +16 dwords (byte
+// offset 64). The PS4 race engine animates that value over the first
+// ~30 s of a race — scene starts bright, game writes a dip, game
+// writes the ramp-back. That dip is what the user sees as blackout.
+//
+// We already proved (Phase 22) that the consumer side can be
+// mitigated by clamping / boosting inside the tonemap shader. This
+// probe attacks the value at the *source*: every time the tonemap
+// compute binds ssbo_5, we overwrite byte 64..67 of the guest buffer
+// with `floatBitsToUint(1.0f)` and invalidate the buffer_cache range
+// so the Vulkan upload picks it up. The game's animation write still
+// lands but gets clobbered back to 1.0f before the compute reads.
+//
+// Enable with env SHADPS4_DC_EXPOSURE_PIN=1. Zero-cost when unset.
+bool IsDcExposurePinEnabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADPS4_DC_EXPOSURE_PIN");
+        const bool v = env && env[0] == '1' && env[1] == '\0';
+        if (v) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-exppin] enabled (SHADPS4_DC_EXPOSURE_PIN=1)");
+        }
+        return v;
+    }();
+    return on;
+}
+
+float GetDcExposurePinValue() {
+    static const float v = [] {
+        const char* env = std::getenv("SHADPS4_DC_EXPOSURE_PIN_VALUE");
+        if (!env || !env[0]) return 1.0f;
+        char* end = nullptr;
+        const float f = std::strtof(env, &end);
+        return end == env ? 1.0f : f;
+    }();
+    return v;
+}
+
+void MaybePinDriveclubExposure(VAddr base, u64 size, u32 cb_idx) {
+    if (!IsDcExposurePinEnabled()) return;
+    if (!IsDriveclubGuardEnabled()) return;
+    if (g_driveclub_race_window.load() == 0) return;
+    // Must be the tonemap compute pipeline and the ssbo_5 binding (index 4).
+    if (g_driveclub_current_pipeline_hash.load() != 0x000002c995517e7full) return;
+    if (g_driveclub_current_draw_kind.load() !=
+        static_cast<u8>(DriveclubDrawKind::Compute)) return;
+    if (cb_idx != 4) return;
+    // Byte offset of the exposure scalar inside ssbo_5: index 16 (dwords)
+    // → byte 64.
+    constexpr size_t kExposureByteOffset = 16 * sizeof(u32);
+    if (base == 0 || size < kExposureByteOffset + sizeof(float)) return;
+    const float threshold = GetDcExposurePinValue();
+    auto* target = reinterpret_cast<float*>(base + kExposureByteOffset);
+    const float previous = *target;
+    // CLAMP MIN, not hard pin. Bright tracks (Canada, Japan) already
+    // have natural values above the threshold and are left alone.
+    // Only the dim-biased tracks (Munnar 19:30, etc.) hit the floor
+    // and get boosted to the threshold value.
+    if (!(previous < threshold)) return;
+    *target = threshold;
+    // Log the first time per session (observability) plus log if the
+    // natural value has visibly changed from the last one we saw —
+    // that gives us a trace of the fade animation curve.
+    static std::mutex log_mutex;
+    static float last_seen_previous = 0.0f;
+    static bool first = true;
+    const u64 submit = g_driveclub_submit_index.load();
+    {
+        std::lock_guard lock{log_mutex};
+        if (first || std::fabs(previous - last_seen_previous) > 0.01f) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-exppin] submit={} addr={:#x} previous={} clamped_to={}",
+                     submit, base + kExposureByteOffset, previous, threshold);
+            last_seen_previous = previous;
+            first = false;
+        }
+    }
+}
+
 bool MaybeSmashDriveclubUbo(VAddr base, u64 size, u32 cb_idx, bool is_written,
                             bool is_formatted) {
     if (!IsDcUboSmashEnabled()) return false;
@@ -2474,8 +2556,19 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(null_buffer.Handle(), 0, VK_WHOLE_SIZE);
             }
         } else {
+            MaybePinDriveclubExposure(vsharp.base_address, size, i);
             if (MaybeSmashDriveclubUbo(vsharp.base_address, size, i,
                                        desc.is_written, desc.is_formatted)) {
+                buffer_cache.InvalidateMemory(vsharp.base_address, size);
+            }
+            // If exposure pin is active and this is the tonemap's ssbo_5,
+            // invalidate the cache so our overwrite propagates to the
+            // Vulkan upload that ObtainBuffer is about to perform.
+            if (IsDcExposurePinEnabled() &&
+                g_driveclub_current_pipeline_hash.load() == 0x000002c995517e7full &&
+                g_driveclub_current_draw_kind.load() ==
+                    static_cast<u8>(DriveclubDrawKind::Compute) &&
+                i == 4) {
                 buffer_cache.InvalidateMemory(vsharp.base_address, size);
             }
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
