@@ -32,16 +32,31 @@ rm -f "$PIDFILE"
 # so we can capture the emulator's pid into the pidfile before exec.
 # The stop script depends on that pidfile to cleanly terminate the
 # session regardless of which eboot path was used.
+# Investigation-probe env vars are passed through as an explicit prefix so
+# the user can toggle them per-launch without editing the script:
+#   SHADPS4_DC_DRAWLOG=1 scripts/run_driveclub_overlay.sh
+#   SHADPS4_DC_TORTURE=1 scripts/run_driveclub_overlay.sh
+PROBE_ENV=""
+for var in SHADPS4_DC_DRAWLOG SHADPS4_DC_TORTURE; do
+  if [[ -n "${!var:-}" ]]; then
+    PROBE_ENV+="${var}=${!var} "
+  fi
+done
+
 exec distrobox-enter gaming -- sh -lc '
   pidfile="$1"
   bin="$2"
   eboot="$3"
-  shift 3
+  probes="$4"
+  shift 4
   export SDL_JOYSTICK_HIDAPI=1
   export SDL_JOYSTICK_HIDAPI_PS4=1
   export SDL_JOYSTICK_HIDAPI_PS5=1
   export SDL_JOYSTICK_HIDAPI_XBOX=1
   export SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
+  if [[ -n "$probes" ]]; then
+    export $probes
+  fi
   # SDL backend auto-picked: wayland first, x11 fallback. We tried
   # hard-forcing x11 for RenderDoc; the distrobox has no XAUTHORITY and
   # the emulator died silently. With rdocEnable off in the per-game
@@ -49,4 +64,4 @@ exec distrobox-enter gaming -- sh -lc '
   # under Wayland.
   echo $$ > "$pidfile"
   exec "$bin" "$eboot" "$@"
-' sh "$PIDFILE" "$BIN" "$EBOOT" "$@"
+' sh "$PIDFILE" "$BIN" "$EBOOT" "$PROBE_ENV" "$@"

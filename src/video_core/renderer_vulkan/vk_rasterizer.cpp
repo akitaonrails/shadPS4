@@ -155,6 +155,100 @@ void NoteDriveclubRaceGateCandidate(const GraphicsPipeline* pipeline, const AmdG
     }
 }
 
+// Driveclub per-draw trace. Enable with env SHADPS4_DC_DRAWLOG=1.
+//
+// For every graphics Draw / DrawIndirect, log one line capturing:
+//   - the current submit index from the existing race-gate machinery
+//   - the pipeline hash
+//   - every bound color-buffer address + the depth-buffer address
+//
+// Rate-limited to one log line per unique (submit_index, pipeline_hash)
+// tuple. A given pipeline that runs many times within a submit logs once
+// per submit, so the log length stays proportional to how many distinct
+// render operations the frame is doing. Cross-correlate with the
+// [dc-timeline] heartbeat in vk_presenter.cpp to pin each log line to a
+// wall-clock window, and with the existing [dc-gate] armed events to know
+// when we are inside the race-start window.
+//
+// Goal: compare the pipeline / render-target signatures emitted during a
+// dim blackout plateau vs the recovered-scene frame directly before
+// recovery. Whichever pipeline appears only in the dim phase (or only in
+// the bright phase) is a strong candidate for the downstream multiplier
+// the animlib scalars cannot reach.
+
+bool IsDcDrawlogEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_DRAWLOG");
+        const bool on = env != nullptr && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "[dc-drawlog] enabled (SHADPS4_DC_DRAWLOG=1)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+void NoteDriveclubDrawlog(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs) {
+    if (!IsDcDrawlogEnabled()) {
+        return;
+    }
+
+    // Only log while codex's race-window guard is armed. The guard is
+    // latched when the later-race pipeline cluster first appears (see
+    // kDriveclubLaterRaceGatePipelines) and stays armed for
+    // kDriveclubRaceWindowSubmits submits afterwards. That window
+    // covers the prerace blackout + the first second or two of race,
+    // which is exactly what we want to diff. Without this filter, a
+    // full session flooded the log with ~5000 lines/second.
+    if (g_driveclub_race_window.load() == 0) {
+        return;
+    }
+
+    const u64 submit_index = g_driveclub_submit_index.load();
+    const u64 pipeline_hash = std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey());
+
+    // Rate-limit: one log line per (submit, pipeline_hash) tuple.
+    // The dedup window is the CURRENT submit; once the submit index
+    // advances, the set is reset so recurrent pipelines are logged again
+    // in the new submit. That gives us per-submit pipeline fingerprints
+    // suitable for frame-to-frame diffing.
+    static u64 dedup_submit = ~0ull;
+    static std::unordered_set<u64> seen_in_submit;
+    static std::mutex dedup_mutex;
+    {
+        std::lock_guard lock{dedup_mutex};
+        if (submit_index != dedup_submit) {
+            dedup_submit = submit_index;
+            seen_in_submit.clear();
+        }
+        if (!seen_in_submit.insert(pipeline_hash).second) {
+            return;
+        }
+    }
+
+    // Collect bound render targets for this draw. Most draws use 0-2
+    // MRT slots; the prerace blackout draws we care about target the
+    // four well-known scene addresses identified in Phase 10-11.
+    std::string rts;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col_buf = regs.color_buffers[cb];
+        if (!col_buf) {
+            continue;
+        }
+        if (!rts.empty()) {
+            rts += ",";
+        }
+        rts += fmt::format("{:#x}", col_buf.Address());
+    }
+    if (rts.empty()) {
+        rts = "<none>";
+    }
+
+    const bool has_depth = regs.depth_buffer.DepthValid();
+    LOG_INFO(Render_Vulkan, "[dc-drawlog] submit={} pipeline={:#018x} rts={} depth={}",
+             submit_index, pipeline_hash, rts, has_depth ? "yes" : "no");
+}
+
 // Driveclub torture probe. Enable with env SHADPS4_DC_TORTURE=1.
 // For draws whose color attachments target one of the critical full-res
 // HDR/composite surfaces, substitute specific sampled source textures with
@@ -445,6 +539,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     NoteDriveclubRaceGateCandidate(pipeline, regs);
+    NoteDriveclubDrawlog(pipeline, regs);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -494,6 +589,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     NoteDriveclubRaceGateCandidate(pipeline, liverpool->regs);
+    NoteDriveclubDrawlog(pipeline, liverpool->regs);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
