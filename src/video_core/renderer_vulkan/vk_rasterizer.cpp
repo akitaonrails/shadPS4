@@ -249,6 +249,120 @@ void NoteDriveclubDrawlog(const GraphicsPipeline* pipeline, const AmdGpu::Regs& 
              submit_index, pipeline_hash, rts, has_depth ? "yes" : "no");
 }
 
+// Driveclub uniform-buffer logger. Enable with env SHADPS4_DC_UBOLOG=1.
+//
+// For each Draw that targets one of a hand-picked set of race-window
+// pipelines, dumps the first 128 bytes of every non-special uniform
+// buffer the shader reads (CB0, CB1, ...). Rate-limited to one dump per
+// (submit_index, pipeline_hash) tuple. The hex bytes plus their float
+// interpretation give us the runtime uniform values the game is feeding
+// into the scene-material shaders during the blackout; we can diff
+// across submits to find which exact float changes from dim to bright
+// at race-start.
+//
+// The pipeline filter avoids dumping all ~400 pipelines. We only log the
+// four MRT-writing "blackout" pipelines plus their "recovery" counterparts
+// that Phase 12's drawlog bisect flagged as the likely candidates.
+
+constexpr std::array<u64, 6> kDcUboLogPipelines{
+    0x3ff0fc8f05bc302dull, // blackout MRT-writer, early-only (from Phase 12 diff)
+    0xd14226a181106f7eull, // recovery counterpart, late-only
+    0xb98e78a7a28007ceull, // race-window MRT-writer (both phases)
+    0x1cdd747ee89204c0ull, // race-window MRT-writer (both phases)
+    0x6bde71906ac1af18ull, // race-window MRT-writer (both phases)
+    0xf6e5670be11b0009ull, // extra race-window candidate from kDriveclubLaterRaceGatePipelines
+};
+
+bool IsDcUboLogEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_UBOLOG");
+        const bool on = env != nullptr && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "[dc-ubolog] enabled (SHADPS4_DC_UBOLOG=1)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+bool IsDcUboLogPipeline(u64 hash) {
+    for (auto p : kDcUboLogPipelines) {
+        if (p == hash) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void NoteDriveclubUboLog(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs) {
+    if (!IsDcUboLogEnabled()) {
+        return;
+    }
+    if (g_driveclub_race_window.load() == 0) {
+        return;
+    }
+
+    const u64 pipeline_hash = std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey());
+    if (!IsDcUboLogPipeline(pipeline_hash)) {
+        return;
+    }
+
+    const u64 submit_index = g_driveclub_submit_index.load();
+
+    // Dedup per (submit, pipeline). Within one submit, one pipeline may
+    // draw many times with identical uniforms — we only want the first
+    // dump.
+    static u64 dedup_submit = ~0ull;
+    static std::unordered_set<u64> seen_in_submit;
+    static std::mutex dedup_mutex;
+    {
+        std::lock_guard lock{dedup_mutex};
+        if (submit_index != dedup_submit) {
+            dedup_submit = submit_index;
+            seen_in_submit.clear();
+        }
+        if (!seen_in_submit.insert(pipeline_hash).second) {
+            return;
+        }
+    }
+
+    // Walk every stage and dump each of its non-special uniform buffers.
+    // Reading from `vsharp.base_address` is safe here because the shader
+    // is about to do the same read via the Vulkan descriptor we're
+    // building from the very same pointer. If it weren't mapped, the
+    // draw itself would have faulted.
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        u32 cb_idx = 0;
+        for (const auto& desc : stage->buffers) {
+            if (desc.IsSpecial()) {
+                cb_idx++;
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(*stage);
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                cb_idx++;
+                continue;
+            }
+            const auto* bytes = reinterpret_cast<const u8*>(vsharp.base_address);
+            const size_t len = std::min<size_t>(128, vsharp.GetSize());
+            std::string hex;
+            hex.reserve(len * 2);
+            for (size_t j = 0; j < len; ++j) {
+                fmt::format_to(std::back_inserter(hex), "{:02x}", bytes[j]);
+            }
+            LOG_INFO(Render_Vulkan,
+                     "[dc-ubolog] submit={} pipeline={:#018x} stage={} cb{} "
+                     "addr={:#x} sz={} bytes={}",
+                     submit_index, pipeline_hash, static_cast<u32>(stage->stage), cb_idx,
+                     vsharp.base_address, vsharp.GetSize(), hex);
+            cb_idx++;
+        }
+    }
+}
+
 // Driveclub torture probe. Enable with env SHADPS4_DC_TORTURE=1.
 // For draws whose color attachments target one of the critical full-res
 // HDR/composite surfaces, substitute specific sampled source textures with
@@ -540,6 +654,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     NoteDriveclubRaceGateCandidate(pipeline, regs);
     NoteDriveclubDrawlog(pipeline, regs);
+    NoteDriveclubUboLog(pipeline, regs);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -590,6 +705,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
     NoteDriveclubRaceGateCandidate(pipeline, liverpool->regs);
     NoteDriveclubDrawlog(pipeline, liverpool->regs);
+    NoteDriveclubUboLog(pipeline, liverpool->regs);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
