@@ -81,6 +81,7 @@ enum class DriveclubDrawKind : u8 {
     Scene = 1,   // writes HDR or G-buffer with depth
     PostFx = 2,  // single-RT fullscreen post-fx or tonemap target
     Ui = 3,      // draws into the visible composite alone (HUD/UI)
+    Compute = 4, // compute dispatch (bloom, exposure, luma, tonemap, ...)
 };
 std::atomic<u8> g_driveclub_current_draw_kind{static_cast<u8>(DriveclubDrawKind::Other)};
 
@@ -969,8 +970,9 @@ u32 GetDcNukeKindMask() {
         } else {
             add("scene",  DriveclubDrawKind::Scene);
             add("postfx", DriveclubDrawKind::PostFx);
-            add("ui",     DriveclubDrawKind::Ui);
-            add("other",  DriveclubDrawKind::Other);
+            add("ui",      DriveclubDrawKind::Ui);
+            add("other",   DriveclubDrawKind::Other);
+            add("compute", DriveclubDrawKind::Compute);
         }
         LOG_INFO(Render_Vulkan, "[dc-texnuke] kind mask = 0x{:x} ({})", m, env);
         return m;
@@ -1263,6 +1265,414 @@ bool MaybeNukeDriveclubTexture(const VideoCore::Image& image) {
              g_driveclub_submit_index.load(),
              g_driveclub_arm_count.load());
     return true;
+}
+
+// Driveclub UBO smasher. Phase 17 — same philosophy as texnuke, but
+// scoped to uniform buffers bound to scene draws. Overwrites the full
+// UBO guest-memory range with a per-address splitmix64 hash pattern
+// so every bound UBO becomes noise; any shader uniform that drives
+// the blackout should therefore stop doing so.
+//
+// Toggles:
+//   SHADPS4_DC_UBO_SMASH=1           master enable
+//   SHADPS4_DC_UBO_SMASH_CB=0,1,2    cb index include list (default: any)
+//   SHADPS4_DC_UBO_SMASH_MIN_SIZE=N  byte size lower bound (default 0)
+//   SHADPS4_DC_UBO_SMASH_MAX_SIZE=N  byte size upper bound (default 0 = unlimited)
+//   SHADPS4_DC_UBO_SMASH_ONLY_READ=1 only nuke read-only buffers
+//                                     (real UBOs, skip SSBOs and formatted)
+//
+// Shares the broader gates with texnuke: SHADPS4_DC_NUKE_AFTER_ARM,
+// SHADPS4_DC_NUKE_KIND (scene by default), plus the race-window guard.
+bool IsDcUboSmashEnabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADPS4_DC_UBO_SMASH");
+        const bool v = env && env[0] == '1' && env[1] == '\0';
+        if (v) {
+            LOG_INFO(Render_Vulkan, "[dc-ubosmash] enabled (SHADPS4_DC_UBO_SMASH=1)");
+        }
+        return v;
+    }();
+    return on;
+}
+
+const std::unordered_set<u32>& GetDcUboSmashCbs() {
+    static const std::unordered_set<u32> set = [] {
+        std::unordered_set<u32> s;
+        const char* env = std::getenv("SHADPS4_DC_UBO_SMASH_CB");
+        if (!env || !env[0]) return s;
+        std::string in = env;
+        size_t pos = 0;
+        while (pos < in.size()) {
+            const size_t end = in.find(',', pos);
+            std::string tok = in.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!tok.empty()) {
+                s.insert(static_cast<u32>(std::strtoul(tok.c_str(), nullptr, 0)));
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        if (!s.empty()) {
+            LOG_INFO(Render_Vulkan, "[dc-ubosmash] cb filter: {} entries", s.size());
+        }
+        return s;
+    }();
+    return set;
+}
+
+u64 GetDcUboSmashMinSize() {
+    static const u64 v = [] {
+        const char* env = std::getenv("SHADPS4_DC_UBO_SMASH_MIN_SIZE");
+        if (!env || !env[0]) return 0ull;
+        return std::strtoull(env, nullptr, 0);
+    }();
+    return v;
+}
+
+u64 GetDcUboSmashMaxSize() {
+    static const u64 v = [] {
+        const char* env = std::getenv("SHADPS4_DC_UBO_SMASH_MAX_SIZE");
+        if (!env || !env[0]) return 0ull;
+        return std::strtoull(env, nullptr, 0);
+    }();
+    return v;
+}
+
+bool GetDcUboSmashOnlyRead() {
+    static const bool v = [] {
+        const char* env = std::getenv("SHADPS4_DC_UBO_SMASH_ONLY_READ");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return v;
+}
+
+// Writes the per-draw UBO at `base` with a per-address random tint.
+// Returns true if a write happened (caller should then invalidate the
+// buffer_cache range so the Vulkan UBO actually picks up the dirty
+// bytes on the next ObtainBuffer).
+bool MaybeSmashDriveclubUbo(VAddr base, u64 size, u32 cb_idx, bool is_written,
+                            bool is_formatted) {
+    if (!IsDcUboSmashEnabled()) return false;
+    if (!IsDriveclubGuardEnabled()) return false;
+    if (g_driveclub_race_window.load() == 0) return false;
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return false;
+    }
+    // Kind gate shared with texnuke.
+    const u32 kind_bit = 1u << g_driveclub_current_draw_kind.load();
+    if ((GetDcNukeKindMask() & kind_bit) == 0) return false;
+
+    if (base == 0 || size == 0) return false;
+    if (GetDcUboSmashOnlyRead() && (is_written || is_formatted)) return false;
+
+    const auto& cbs = GetDcUboSmashCbs();
+    if (!cbs.empty() && cbs.count(cb_idx) == 0) return false;
+
+    const u64 min_sz = GetDcUboSmashMinSize();
+    const u64 max_sz = GetDcUboSmashMaxSize();
+    if (min_sz > 0 && size < min_sz) return false;
+    if (max_sz > 0 && size > max_sz) return false;
+
+    // Per-UBO deterministic tint via splitmix64 avalanche on base.
+    u64 h = base;
+    h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+    h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+    h = h ^ (h >> 31);
+    const u32 pattern = static_cast<u32>(h >> 32);
+
+    auto* dst = reinterpret_cast<u32*>(base);
+    const size_t n = size / 4;
+    for (size_t i = 0; i < n; ++i) dst[i] = pattern;
+
+    static std::mutex seen_mutex;
+    static std::unordered_set<u64> seen;
+    const u64 key = (g_driveclub_current_pipeline_hash.load() << 8) ^
+                    (static_cast<u64>(cb_idx) << 1) ^ base;
+    bool first = false;
+    {
+        std::lock_guard lock{seen_mutex};
+        first = seen.insert(key).second;
+    }
+    if (first) {
+        LOG_INFO(Render_Vulkan,
+                 "[dc-ubosmash] addr={:#x} size={} cb={} pipe={:#018x} arm={}",
+                 base, size, cb_idx, g_driveclub_current_pipeline_hash.load(),
+                 g_driveclub_arm_count.load());
+    }
+    return true;
+}
+
+// Driveclub compute dispatch log (Phase 19).
+// Enable with env SHADPS4_DC_DISPATCHLOG=1.
+//
+// Logs one line per unique (submit, compute_pipeline_hash) tuple
+// while the race-window gate is armed. Intended to map the compute
+// dispatch landscape the same way the drawlog maps graphics draws,
+// so we can tell which compute passes run during dim vs bright and
+// where to point the UBO/texture smash.
+bool IsDcDispatchLogEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_DISPATCHLOG");
+        const bool on = env != nullptr && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-dispatchlog] enabled (SHADPS4_DC_DISPATCHLOG=1)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+// SHADPS4_DC_DISPATCH_SKIP=0xHH,0xII,... — when the current compute
+// pipeline hash matches one of these, the dispatch is turned into a
+// pure no-op (the cmdbuf.dispatch call is never emitted). Gated by
+// the race-window guard and NUKE_AFTER_ARM so pre-race state that
+// might share a pipeline hash with an in-race one stays intact.
+//
+// Intended use: Phase 19b identified eight compute pipelines that
+// fire during dim and go silent the moment the blackout lifts. This
+// env var lets us force those into silence from the start and see
+// whether the blackout ever develops.
+// Same pattern as DISPATCH_SKIP but for graphics draws. Comma-
+// separated pipeline hashes whose Draw/DrawIndirect call becomes a
+// no-op when the current pipeline matches. Gated by the race window
+// + NUKE_AFTER_ARM.
+const std::unordered_set<u64>& GetDcDrawSkipPipes() {
+    static const std::unordered_set<u64> set = [] {
+        std::unordered_set<u64> s;
+        const char* env = std::getenv("SHADPS4_DC_DRAW_SKIP");
+        if (!env || !env[0]) return s;
+        std::string in = env;
+        size_t pos = 0;
+        while (pos < in.size()) {
+            const size_t end = in.find(',', pos);
+            std::string tok = in.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!tok.empty()) {
+                const u64 v = std::strtoull(tok.c_str(), nullptr, 0);
+                if (v) s.insert(v);
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        if (!s.empty()) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-drawskip] {} pipeline(s) configured (SHADPS4_DC_DRAW_SKIP)",
+                     s.size());
+        }
+        return s;
+    }();
+    return set;
+}
+
+bool ShouldSkipDriveclubDraw(u64 pipeline_hash) {
+    const auto& skip = GetDcDrawSkipPipes();
+    if (skip.empty()) return false;
+    if (!IsDriveclubGuardEnabled()) return false;
+    if (g_driveclub_race_window.load() == 0) return false;
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return false;
+    }
+    if (skip.count(pipeline_hash) == 0) return false;
+
+    static std::mutex seen_mutex;
+    static std::unordered_set<u64> seen;
+    bool first = false;
+    {
+        std::lock_guard lock{seen_mutex};
+        first = seen.insert(pipeline_hash).second;
+    }
+    if (first) {
+        LOG_INFO(Render_Vulkan,
+                 "[dc-drawskip] no-op draw pipeline={:#018x} first-seen submit={}",
+                 pipeline_hash, g_driveclub_submit_index.load());
+    }
+    return true;
+}
+
+const std::unordered_set<u64>& GetDcDispatchSkipPipes() {
+    static const std::unordered_set<u64> set = [] {
+        std::unordered_set<u64> s;
+        const char* env = std::getenv("SHADPS4_DC_DISPATCH_SKIP");
+        if (!env || !env[0]) return s;
+        std::string in = env;
+        size_t pos = 0;
+        while (pos < in.size()) {
+            const size_t end = in.find(',', pos);
+            std::string tok = in.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!tok.empty()) {
+                const u64 v = std::strtoull(tok.c_str(), nullptr, 0);
+                if (v) s.insert(v);
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        if (!s.empty()) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-dispatchskip] {} pipeline(s) configured (SHADPS4_DC_DISPATCH_SKIP)",
+                     s.size());
+        }
+        return s;
+    }();
+    return set;
+}
+
+bool ShouldSkipDriveclubDispatch(u64 pipeline_hash) {
+    const auto& skip = GetDcDispatchSkipPipes();
+    if (skip.empty()) return false;
+    if (!IsDriveclubGuardEnabled()) return false;
+    if (g_driveclub_race_window.load() == 0) return false;
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return false;
+    }
+    if (skip.count(pipeline_hash) == 0) return false;
+
+    static std::mutex seen_mutex;
+    static std::unordered_set<u64> seen;
+    bool first = false;
+    {
+        std::lock_guard lock{seen_mutex};
+        first = seen.insert(pipeline_hash).second;
+    }
+    if (first) {
+        LOG_INFO(Render_Vulkan,
+                 "[dc-dispatchskip] no-op dispatch pipeline={:#018x} first-seen submit={}",
+                 pipeline_hash, g_driveclub_submit_index.load());
+    }
+    return true;
+}
+
+void NoteDriveclubDispatchlog(u64 pipeline_hash, u64 shader_pgm_hash,
+                              u32 dim_x, u32 dim_y, u32 dim_z) {
+    if (!IsDcDispatchLogEnabled()) return;
+    if (g_driveclub_race_window.load() == 0) return;
+
+    const u64 submit_index = g_driveclub_submit_index.load();
+    static u64 dedup_submit = ~0ull;
+    static std::unordered_set<u64> seen_in_submit;
+    static std::mutex dedup_mutex;
+    {
+        std::lock_guard lock{dedup_mutex};
+        if (submit_index != dedup_submit) {
+            dedup_submit = submit_index;
+            seen_in_submit.clear();
+        }
+        if (!seen_in_submit.insert(pipeline_hash).second) {
+            return;
+        }
+    }
+    LOG_INFO(Render_Vulkan,
+             "[dc-dispatchlog] submit={} pipeline={:#018x} shader={:#018x} dim=({},{},{})",
+             submit_index, pipeline_hash, shader_pgm_hash, dim_x, dim_y, dim_z);
+}
+
+// Driveclub push-constant smasher (Phase 18).
+//
+// shadPS4's Shader::PushData packs:
+//   [0..15]   viewport xoffset/yoffset/xscale/yscale (4 floats)
+//   [16..79]  ud_regs[16]   (the GCN user-data registers — scalars
+//                            the PS4 game passes per-draw)
+//   [80..]    buf_offsets[] (alignment fix-ups, infrastructure)
+//
+// Viewport and buf_offsets are load-bearing; touching them crashes
+// clip-space / buffer binding. The interesting attack surface is
+// ud_regs — 16 × u32 scalars that carry per-draw material / fade /
+// exposure constants, exactly the layer we could not isolate in
+// Phase 17's UBO smashing because whole-UBO garbage either killed
+// transforms or missed the field.
+//
+// Env toggles:
+//   SHADPS4_DC_PC_SMASH=1                  master enable
+//   SHADPS4_DC_PC_RANGE=<first>,<last>     inclusive ud_regs indices (default 0,15)
+//   SHADPS4_DC_PC_VALUE=<hex>              replacement u32 (default per-draw hash)
+//
+// Reuses the shared gates SHADPS4_DC_NUKE_AFTER_ARM, SHADPS4_DC_NUKE_KIND
+// and the race-window guard. Zero-cost when the master enable is off.
+bool IsDcPushConstantSmashEnabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADPS4_DC_PC_SMASH");
+        const bool v = env && env[0] == '1' && env[1] == '\0';
+        if (v) {
+            LOG_INFO(Render_Vulkan, "[dc-pcsmash] enabled (SHADPS4_DC_PC_SMASH=1)");
+        }
+        return v;
+    }();
+    return on;
+}
+
+std::pair<u32, u32> GetDcPushConstantRange() {
+    static const auto p = [] {
+        const char* env = std::getenv("SHADPS4_DC_PC_RANGE");
+        std::pair<u32, u32> def{0u, 15u};
+        if (!env || !env[0]) return def;
+        std::string s = env;
+        const auto comma = s.find(',');
+        if (comma == std::string::npos) return def;
+        const u32 lo = static_cast<u32>(std::strtoul(s.substr(0, comma).c_str(), nullptr, 0));
+        const u32 hi = static_cast<u32>(std::strtoul(s.substr(comma + 1).c_str(), nullptr, 0));
+        LOG_INFO(Render_Vulkan, "[dc-pcsmash] range = [{}..{}]", lo, hi);
+        return std::pair<u32, u32>{lo, std::min(hi, 15u)};
+    }();
+    return p;
+}
+
+// Optional fixed replacement value for ud_regs. If 0 (default), we use
+// a per-draw splitmix64 hash of the pipeline hash so different draws
+// get different garbage (same strategy as texnuke / ubosmash).
+u32 GetDcPushConstantFixedValue() {
+    static const u32 v = [] {
+        const char* env = std::getenv("SHADPS4_DC_PC_VALUE");
+        if (!env || !env[0]) return 0u;
+        return static_cast<u32>(std::strtoul(env, nullptr, 0));
+    }();
+    return v;
+}
+
+void MaybeSmashDriveclubPushConstants(Shader::PushData& push_data) {
+    if (!IsDcPushConstantSmashEnabled()) return;
+    if (!IsDriveclubGuardEnabled()) return;
+    if (g_driveclub_race_window.load() == 0) return;
+
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return;
+    }
+    const u32 kind_bit = 1u << g_driveclub_current_draw_kind.load();
+    if ((GetDcNukeKindMask() & kind_bit) == 0) return;
+
+    const auto [lo, hi] = GetDcPushConstantRange();
+    const u32 fixed = GetDcPushConstantFixedValue();
+
+    u32 replacement;
+    if (fixed != 0) {
+        replacement = fixed;
+    } else {
+        u64 h = g_driveclub_current_pipeline_hash.load();
+        h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+        h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+        h = h ^ (h >> 31);
+        replacement = static_cast<u32>(h);
+    }
+
+    const u32 last = std::min(hi, static_cast<u32>(push_data.ud_regs.size() - 1));
+    for (u32 i = lo; i <= last; ++i) {
+        push_data.ud_regs[i] = replacement;
+    }
+
+    static std::mutex seen_mutex;
+    static std::unordered_set<u64> seen;
+    const u64 key = g_driveclub_current_pipeline_hash.load();
+    bool first = false;
+    {
+        std::lock_guard lock{seen_mutex};
+        first = seen.insert(key).second;
+    }
+    if (first) {
+        LOG_INFO(Render_Vulkan,
+                 "[dc-pcsmash] pipeline={:#018x} range=[{}..{}] value={:#x} arm={}",
+                 key, lo, last, replacement, g_driveclub_arm_count.load());
+    }
 }
 
 void MaybeDumpDriveclubTexture(const VideoCore::Image& image) {
@@ -1581,6 +1991,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     g_driveclub_current_pipeline_hash.store(
         std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()));
     g_driveclub_current_draw_kind.store(static_cast<u8>(ClassifyDriveclubDraw(regs)));
+    if (ShouldSkipDriveclubDraw(g_driveclub_current_pipeline_hash.load())) {
+        return;
+    }
     NoteDriveclubRaceGateCandidate(pipeline, regs);
     NoteDriveclubDrawlog(pipeline, regs);
     NoteDriveclubUboLog(pipeline, regs);
@@ -1599,6 +2012,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         buffer_cache.BindIndexBuffer(index_offset);
     }
 
+    MaybeSmashDriveclubPushConstants(push_data);
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1639,6 +2053,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()));
     g_driveclub_current_draw_kind.store(
         static_cast<u8>(ClassifyDriveclubDraw(liverpool->regs)));
+    if (ShouldSkipDriveclubDraw(g_driveclub_current_pipeline_hash.load())) {
+        return;
+    }
     NoteDriveclubRaceGateCandidate(pipeline, liverpool->regs);
     NoteDriveclubDrawlog(pipeline, liverpool->regs);
     NoteDriveclubUboLog(pipeline, liverpool->regs);
@@ -1666,6 +2083,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         std::tie(count_buffer, count_base) = buffer_cache.ObtainBuffer(count_address, 4, false);
     }
 
+    MaybeSmashDriveclubPushConstants(push_data);
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1709,6 +2127,16 @@ void Rasterizer::DispatchDirect() {
     if (!pipeline) {
         return;
     }
+    const u64 cs_hash =
+        std::hash<ComputePipelineKey>{}(pipeline->GetComputeKey());
+    g_driveclub_current_pipeline_hash.store(cs_hash);
+    g_driveclub_current_draw_kind.store(static_cast<u8>(DriveclubDrawKind::Compute));
+    NoteDriveclubDispatchlog(cs_hash,
+                             pipeline->GetStage(Shader::LogicalStage::Compute).pgm_hash,
+                             cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (ShouldSkipDriveclubDispatch(cs_hash)) {
+        return;
+    }
 
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
@@ -1720,6 +2148,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     scheduler.EndRendering();
+    MaybeSmashDriveclubPushConstants(push_data);
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1739,6 +2168,16 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!pipeline) {
         return;
     }
+    const u64 cs_hash =
+        std::hash<ComputePipelineKey>{}(pipeline->GetComputeKey());
+    g_driveclub_current_pipeline_hash.store(cs_hash);
+    g_driveclub_current_draw_kind.store(static_cast<u8>(DriveclubDrawKind::Compute));
+    NoteDriveclubDispatchlog(cs_hash,
+                             pipeline->GetStage(Shader::LogicalStage::Compute).pgm_hash,
+                             cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (ShouldSkipDriveclubDispatch(cs_hash)) {
+        return;
+    }
 
     if (!BindResources(pipeline)) {
         return;
@@ -1747,6 +2186,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
 
     scheduler.EndRendering();
+    MaybeSmashDriveclubPushConstants(push_data);
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -2034,6 +2474,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(null_buffer.Handle(), 0, VK_WHOLE_SIZE);
             }
         } else {
+            if (MaybeSmashDriveclubUbo(vsharp.base_address, size, i,
+                                       desc.is_written, desc.is_formatted)) {
+                buffer_cache.InvalidateMemory(vsharp.base_address, size);
+            }
             const auto [vk_buffer, offset] = buffer_cache.ObtainBuffer(
                 vsharp.base_address, size, desc.is_written, desc.is_formatted, buffer_id);
             const u32 offset_aligned = Common::AlignDown(offset, alignment);

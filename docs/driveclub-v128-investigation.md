@@ -4683,3 +4683,756 @@ Ranked by payoff vs effort:
 Nothing changes emulator behaviour unless a `SHADPS4_DC_*` env var
 is set. Safe to leave on the branch while the investigation moves
 to compute.
+
+## Phase 17 — UBO batch smashing
+
+Texture-content exhaustion at the end of Phase 16 pushed us into the
+uniform-buffer path. Same mechanics, new target:
+`MaybeSmashDriveclubUbo(base, size, cb_idx, is_written, is_formatted)`
+hooks `Rasterizer::BindBuffers` just before `buffer_cache.ObtainBuffer`,
+writes a per-address splitmix64 tint over the full UBO range, then
+calls `buffer_cache.InvalidateMemory(base, size)` so the Vulkan UBO
+re-uploads the clobbered bytes. Env knobs, all runtime and zero-cost
+when unset:
+
+- `SHADPS4_DC_UBO_SMASH=1`            master enable
+- `SHADPS4_DC_UBO_SMASH_CB=0,1,...`   cb-index include list
+- `SHADPS4_DC_UBO_SMASH_MIN_SIZE=N`   byte floor
+- `SHADPS4_DC_UBO_SMASH_MAX_SIZE=N`   byte ceiling (0 = unlimited)
+- `SHADPS4_DC_UBO_SMASH_ONLY_READ=1`  skip SSBOs / formatted buffers
+
+Shares the broader gates with texnuke (`SHADPS4_DC_NUKE_AFTER_ARM`,
+`SHADPS4_DC_NUKE_KIND`, plus the race-window guard).
+
+### Six-batch rotation
+
+Time-boxed to ≤6 bracket tries before pivoting to a different class:
+
+| # | filter                                        | observed                                                        | dim? |
+|---|-----------------------------------------------|-----------------------------------------------------------------|------|
+| 1 | all read-only scene UBOs                       | heavy blinking, whites/blacks/red-yellow explosions             | yes  |
+| 2 | `CB=0` only                                    | crash on race load (SIGTRAP) — cb0 carries view / clip-space    | —    |
+| 3 | `CB=1` only                                    | same crash — cb1 also carries transforms                        | —    |
+| 4 | `MAX_SIZE=256`, all cb                         | scene over-exposes to white with cyan bokeh rings               | yes  |
+| 5 | `CB=2,3,4 MAX_SIZE=256`                        | colour scene blinks + persistent white lens-dirt bokeh overlay  | yes  |
+| 6 | `MIN_SIZE=16 MAX_SIZE=64`, all cb              | cyan/green bokeh overlay following the car's headlights         | yes  |
+
+Screenshots of rounds 4..6 show the bokeh patterns tracking the car's
+own light sources — those small UBOs are per-light constants, and
+the visible transition between "during blackout" and "after lift"
+still plays out over our garbage overlay (darker HDR beneath → white
+bokeh; brighter HDR beneath → greener bokeh). The dim keeps cycling
+on its usual 8–30 s schedule through every one of the six rounds.
+Not a single batch shifts blackout timing, extent, or lift moment.
+
+### Honest read
+
+**The UBO smash did not hit the dim driver within the six-batch
+budget.** That's not the same as "the dim isn't in UBOs" — it means
+the brackets we could safely test (cb≥2, size ≤64, etc.) don't cover
+it, and the brackets that would cover it (cb=0 / cb=1, large-size)
+are load-bearing for the pipeline and crash when smashed. We are at
+a real diagnostic limit of the random-fill approach: any bracket
+wide enough to include the dim also includes transforms that kill
+the session.
+
+What's still on the table for a smarter probe:
+
+1. **Targeted single-field mutation, not a random fill.** Pick each
+   4-byte offset inside a candidate UBO one at a time, force it to a
+   known value (0, 1, or the observed "bright" value), and watch
+   the blackout. This is strictly safer than the random tint because
+   adjacent fields stay valid. The offset-by-offset sweep that
+   Phase 13 started but did not finish.
+2. **Per-shader offset skips.** Keep the random fill, but pre-
+   compute "skip bytes 0..63 of cb0 because this shader's vertex
+   transform is there". Requires parsing the shader's buffer
+   resource table.
+3. **Push constants.** Never instrumented. ≤128 bytes, per-draw, and
+   exactly the place an engine would put a per-draw multiplier or
+   fade scalar.
+4. **Compute dispatch output.** Still unprobed. Bloom / auto-
+   exposure / luma integration are the likeliest dim homes; they
+   feed graphics through SSBOs our UBO smash already covers, but
+   only if the SSBO is bound as a uniform descriptor — if it's bound
+   as storage, `SHADPS4_DC_UBO_SMASH_ONLY_READ=1` filters it out.
+   A compute-side probe would cover it either way.
+
+### Commit state at end of Phase 17
+
+`src/video_core/renderer_vulkan/vk_rasterizer.cpp` now carries:
+
+- `MaybeSmashDriveclubUbo` + its knob-readers (Phase 17)
+- all of Phase 16's texnuke infrastructure
+- all of Phase 15's texdump infrastructure
+- all of Phase 13's targeted UBO clamp/restore/nuke probes
+
+`scripts/run_driveclub_overlay.sh` now passes through all nine of
+the `SHADPS4_DC_*` probe env vars.
+
+Nothing mutates emulator behaviour unless a matching env var is set.
+
+## Phase 18 — push-constant smashing (null result)
+
+Quick complement to Phase 17, budgeted at three batches but resolved
+in one.
+
+### Scaffolding
+
+`MaybeSmashDriveclubPushConstants(Shader::PushData& push_data)` is
+invoked at every `pipeline->BindResources(..., push_data)` site in
+`Rasterizer::Draw / DrawIndirect / Dispatch / DispatchIndirect`.
+It rewrites `ud_regs[lo..hi]` with either a per-pipeline hash or an
+explicit u32 chosen by env var. Viewport offsets and buffer
+alignment bytes stay intact — touching them breaks clip-space or
+buffer binding.
+
+Env toggles:
+
+- `SHADPS4_DC_PC_SMASH=1`             master enable
+- `SHADPS4_DC_PC_RANGE=<lo>,<hi>`     inclusive ud_regs indices (default 0,15)
+- `SHADPS4_DC_PC_VALUE=<hex>`         replacement u32 (default per-pipeline hash)
+
+Re-uses the shared race-window / `NUKE_AFTER_ARM` / `NUKE_KIND`
+gates.
+
+### One-batch outcome
+
+Round 1: `PC_SMASH=1 PC_RANGE=0,15 NUKE_AFTER_ARM=3 KIND=scene`
+
+Log confirms the probe fired 188× across scene pipelines with a
+per-draw random u32 written to every ud_reg. User reported:
+baseline visual, blackout normal, lifts at the usual 6 s mark.
+**Zero observable effect.**
+
+### Why this is a real dead-end, not a resolution problem
+
+shadPS4's `PushData` layout is a thin carrier for four viewport
+scalars + a copy of the PS4's 16 GCN user-data registers + per-
+binding offset alignment bytes. The host SPIR-V it emits rarely
+reads the ud_regs array directly — game-side per-draw scalars come
+in through bound UBOs, which shaders reference via descriptor
+resources, not push-constants. So rewriting ud_regs is architecturally
+*not* expected to move anything visual in most scene pipelines; the
+null result confirms that rather than contradicting it.
+
+Budget collapse: if every register gets rewritten and nothing moves,
+sub-brackets of the same registers will also not move. Kept batch 2
+and 3 unused, and exit this phase early.
+
+### What the four-probe exhaustion now means
+
+Every shader-reachable piece of draw-time state has been poked:
+
+| surface           | mechanism                      | result          |
+|-------------------|--------------------------------|-----------------|
+| textures          | in-place write + invalidate    | no dim (P16)    |
+| UBOs              | in-place write + invalidate    | no dim (P17)    |
+| push constants    | in-place write in the carrier  | no effect (P18) |
+| per-pipeline UBO  | targeted offset clamp (P13)    | no dim          |
+
+The dim is therefore either:
+
+- in a **compute-shader output** that graphics consumes through a
+  descriptor path our probe can't reach (storage image with
+  `GpuModified`, which the texnuke deliberately skips), or
+- in a **fixed-function pipeline state** the shader does not see —
+  a blend constant, a blend factor, a colour-write mask, or a
+  viewport scissor effect, or
+- generated by **something outside the draw loop entirely** —
+  presenter-side post-fx, swapchain gamma, display-target
+  conversion, or a compute pass whose work item is the tonemap
+  itself.
+
+### Commit state at end of Phase 18
+
+`src/video_core/renderer_vulkan/vk_rasterizer.cpp` gains
+`MaybeSmashDriveclubPushConstants` + its three knob-readers + four
+call-site insertions. Zero-cost when `SHADPS4_DC_PC_SMASH` is unset.
+
+### Next — compute-dispatch probe (Phase 19)
+
+Goal: add the same dump-then-smash pattern to `Rasterizer::Dispatch`
+/ `DispatchIndirect`. Three planned batches, narrowed on evidence:
+
+1. Log every compute dispatch that fires inside the race window,
+   with pipeline hash, workgroup dims, and bound buffer/image
+   descriptors.
+2. Smash all **read-only** UBO/SSBO inputs to compute — per-pipeline
+   tint, same invalidate-then-ObtainBuffer path.
+3. Smash the **output** of compute (writable SSBOs, storage images)
+   right after the dispatch — forces graphics to read the nuked
+   bytes before compute rewrites them.
+
+If any of the three shifts blackout timing, we've finally isolated
+the layer. If all three come back clean, the dim is in fixed-
+function state or outside the per-frame draw loop and we re-open
+the presenter-side paths.
+
+## Phase 19 — compute dispatch probe (crashes, not dim)
+
+### Scaffolding
+
+- New `DriveclubDrawKind::Compute = 4`.
+- `Rasterizer::DispatchDirect` / `DispatchIndirect` set the current
+  pipeline hash (via `ComputePipeline::GetComputeKey()`) and the
+  current draw-kind to `Compute` before `BindResources`, so the
+  existing UBO smasher and texture nuker can target compute
+  pipelines using `SHADPS4_DC_NUKE_KIND=compute`.
+- `NoteDriveclubDispatchlog(hash, dim_x, dim_y, dim_z)` logs one
+  `[dc-dispatchlog]` line per (submit, pipeline) tuple inside the
+  race window. Enable with `SHADPS4_DC_DISPATCHLOG=1`.
+
+### Dispatch landscape
+
+A single clean race run with `DISPATCHLOG=1` captured 19066
+dispatch events over ~30 s inside the race window. The workgroup
+shape distribution cleanly identifies the classic HDR-exposure /
+bloom compute chain:
+
+| dim              | count | plausible role                               |
+|------------------|-------|----------------------------------------------|
+| (1, 1, 1)        | 4560  | scalar reduction / final aggregate write      |
+| (256, 1, 1)      | 2918  | histogram accumulation (256 luminance bins)   |
+| (256, 128, 1)    | 2275  | full-screen tiled dispatch                    |
+| (240, 135, 1)    | 1004  | 1920/8 × 1080/8 bloom / luma downsample       |
+| (120, 68, 1)     | 282   | 1920/16 × 1080/16 mip                         |
+| (64, 64, 6)      | 276   | cube-map post-process (6 faces)              |
+| (16, 16, 1)      | 351   | 32× downsample tile-grid                      |
+| (8, 8, 1)        | 252   | finer compute tile                            |
+
+`(1,1,1)` alone has **21 unique pipeline hashes**. These are the
+prime candidates for "writes a single scalar to an exposure /
+gamma buffer that graphics then reads".
+
+### Three-batch mutation sweep, all three crashed
+
+The UBO smasher was re-targeted at compute by setting
+`NUKE_KIND=compute`, keeping its existing size/cb filters.
+
+1. **Smash all read-only compute UBOs**
+   → crash on race load (SIGTRAP / exit 133).
+2. **Smash ≤256 B read-only compute UBOs**
+   → crash on race load.
+3. **Smash only `(1,1,1)` dispatches' ≤256 B UBOs**
+   (pipeline filter applied only to textures, UBO smash stayed
+   broad because `MaybeSmashDriveclubUbo` has no pipeline-hash
+   filter)
+   → crash on race load.
+
+Observation: compute-bound UBOs in shadPS4 very often carry **buffer
+addresses / descriptor pointers**, not plain scalars. A random-fill
+pattern therefore nulls a pointer that the compute kernel
+dereferences next, and the dispatch faults before any useful output
+gets written. Every broad batch hits this failure mode.
+
+### Full diagnostic exhaustion table
+
+| phase | surface                     | budget used | outcome             |
+|-------|-----------------------------|-------------|---------------------|
+| 13    | UBO offset targeted clamp   | per-pipeline| no dim              |
+| 15    | texture dump                | —           | observability only  |
+| 16    | texture content random-fill | 10 batches  | no dim              |
+| 17    | graphics UBO random-fill    | 6 batches   | chaos; no dim       |
+| 18    | graphics push constants     | 1 batch     | not consumed        |
+| 19    | compute UBO random-fill     | 3 batches   | 3/3 crashes         |
+
+The random-fill approach is now a dead end across the four probe-
+reachable layers — any bracket wide enough to include the dim is
+wide enough to either mask it (chaos) or kill the frame before the
+blackout transition can be observed.
+
+### Three remaining attack paths
+
+1. **Dim-phase dispatch bisect.** Re-run with `DISPATCHLOG=1`, note
+   the submit numbers at "mirror goes black" and "mirror animates
+   again" (the user already uses those as reliable phase markers).
+   Grep the log for pipelines that fire **only** during the dim
+   submit range. Phase 12's asset-side bisect applied to compute.
+   Low cost, no new code.
+2. **Compute-output replay.** Intercept *after* the dispatch —
+   right after `cmdbuf.dispatch(...)` — and overwrite the writable
+   SSBO(s) the kernel just produced with a known identity value
+   (`1.0f`, or a captured-bright-phase snapshot). Zero crash risk
+   because the kernel has already finished; we are only
+   corrupting downstream reads. Requires a new probe next to
+   `NoteDriveclubDispatchlog`.
+3. **Eboot disassembly, informed by diagnostic exhaustion.** Codex
+   went through 12 phases of eboot RE with cold leads. Repeating
+   that work now with "the dim is not in texture / UBO / push-
+   constant / compute-input" as a constraint narrows the search
+   considerably: the write must either happen in a shader we
+   haven't instrumented, in presenter-side post-fx, or in the
+   compute output path covered by option 2.
+
+### Commit state at end of Phase 19
+
+`src/video_core/renderer_vulkan/vk_rasterizer.cpp` gains:
+
+- `DriveclubDrawKind::Compute` + its mask entry
+- `IsDcDispatchLogEnabled` + `NoteDriveclubDispatchlog`
+- dispatch-site instrumentation for pipeline hash + draw kind at
+  both Direct and Indirect entry points
+
+`scripts/run_driveclub_overlay.sh` passes through
+`SHADPS4_DC_DISPATCHLOG`.
+
+Zero-cost when no `SHADPS4_DC_*` env var is set.
+
+## Phase 19b — dim-vs-lift dispatch diff (the first real hit)
+
+After three failed attempts to random-fill compute UBOs, pivoted to
+a dispatch-frequency diff: clean baseline run with DRAWLOG +
+DISPATCHLOG, user reports wall-clock at blackout start and end, we
+map those onto the `[dc-timeline]` heartbeat and split the session
+into pre-race / dim / bright submit windows.
+
+### The run
+
+- emulator start (pidfile mtime): `17:15:52.48`
+- blackout starts (user):         `17:16:20` → ~28 s into session → t≈28000 ms
+- blackout lifts (user):           `17:16:50` → ~58 s into session → t≈58000 ms
+- session ends (log mtime):        `17:17:17` → ~85 s wall-clock, t=76500 ms in the log
+
+Dim window: 30 s. Bright window (post-lift): 18 s. Pre-race: 28 s.
+
+Cross-referenced against the timeline heartbeat:
+
+- dim starts at **submit ≈ 1418** (timeline t=28083 ms, frame=1575)
+- dim ends at   **submit ≈ 2536** (timeline t=57966 ms, frame=3255)
+- session ends  submit ≈ 3261 (t=76500 ms, frame=4365)
+
+### Per-pipeline dispatch counts across the three windows
+
+Parsed 158758 `[dc-dispatchlog]` entries, bucketed each into pre /
+dim / bright by submit. Looked for pipelines that fire inside dim
+and **do not fire at all inside bright**:
+
+| pipeline                | shape        | pre | dim | bright |
+|-------------------------|--------------|-----|-----|--------|
+| `0x0000089fc5730348`    | (16, 1, 1)   | 420 | 961 | **0**  |
+| `0x000008323ad915ad`    | (2, 2, 1)    | 420 | 961 | **0**  |
+| `0x00000eea2b7d89d4`    | **(1, 1, 1)**| 420 | 961 | **0**  |
+| `0x000002da4ae7f686`    | (120, 68, 1) | 43  | 164 | **0**  |
+| `0x000006b667870fd4`    | (256, 256, 1)| 2   | 5   | **0**  |
+| `0x00000bba6f0b7ff2`    | (128, 1, 1)  | 4   | 3   | **0**  |
+| `0x00000495f24bd6da`    | (256, 128, 1)| 4   | 3   | **0**  |
+| `0x00000f56cce1d724`    | **(1, 1, 1)**| 54  | 72  | **0**  |
+
+### Why this is the first genuine hit
+
+Every previous probe either changed **nothing** (texture content,
+push constants) or changed **everything** (broad UBO smash, broad
+compute smash). This diff finds eight specific compute pipelines
+that *naturally* stop running the instant the blackout lifts. The
+shapes alone tell the story:
+
+- (120, 68, 1) = 1920/16 × 1080/16 — screen-space downsample at
+  16× mip, classic bloom / luma first stage
+- (256, 128, 1) = fullscreen tile grid
+- (256, 256, 1) = 256² histogram / atlas fill
+- (128, 1, 1), (16, 1, 1) = reductions along the linear axis
+- (2, 2, 1) = 4-thread aggregate
+- (1, 1, 1) **×2** = single-workgroup single-invocation writes —
+  each of these is producing exactly one scalar, which is the
+  textbook signature of an auto-exposure integrator
+
+That chain — downsample → histogram → reduce → single-scalar
+write — is **exactly** the HDR eye-adaptation pipeline every modern
+engine runs. It stops when the adaptation converges and the
+tonemap locks to a final exposure, which is what the user sees
+when the blackout "lifts".
+
+### What this means for every preceding phase
+
+- Phase 13's luminance clamp on `0xf6e5670be11b0009` offset 3
+  could not land because it was targeting a graphics pipeline that
+  *consumed* the compute-written exposure, not the one that *wrote*
+  it. Offset 3 was the live adapted-luminance value the fragment
+  shader reads after compute has already set it; clamping the
+  consumer doesn't stop the compute from re-writing the next frame.
+- Phase 16's texture nukes never shifted the dim because no
+  texture drives it — the live exposure value is written to a
+  storage buffer by compute, not encoded in any sampled asset.
+- Phase 17's graphics UBO smash mostly rolled through without
+  hitting it because the dim scalar lives in a compute-written SSBO
+  that the graphics pipelines read as a descriptor, and our
+  filters / size brackets kept missing the exact buffer.
+- Phase 19's compute UBO random-fill kept crashing because those
+  same UBOs carry descriptor pointers; nuking them SIGTRAPs before
+  the single-scalar output buffer ever gets a chance to be written.
+
+The exhaustion chain wasn't wasted — it forced us to *prove*
+everything else was clean, which is what made this diff readable
+in the first place.
+
+### Planned Phase 20 — dispatch skip
+
+Next step is a surgical no-op: add a `SHADPS4_DC_DISPATCH_SKIP=
+0xHH,0xII,...` env var that intercepts `Rasterizer::DispatchDirect`
+and `DispatchIndirect`, and if the current compute pipeline hash is
+in the skip list, returns before `cmdbuf.dispatch(...)` runs. The
+dispatch becomes a pure no-op.
+
+Test sequence (no rebuilds needed between runs):
+
+1. Skip both (1,1,1) writers:
+   `SHADPS4_DC_DISPATCH_SKIP=0x00000eea2b7d89d4,0x00000f56cce1d724`
+   — expected: adaptation stops updating, scene stays at whatever
+   the previous-written exposure value was. If blackout never
+   develops on race start, those scalars are the dim driver.
+2. Skip the three top-firing ones (16,1,1) + (2,2,1) + (1,1,1):
+   `SHADPS4_DC_DISPATCH_SKIP=0x0000089fc5730348,0x000008323ad915ad,0x00000eea2b7d89d4`
+   — expected: breaks the reduction chain earlier. If skipping
+   just the scalar writer isn't enough but the chain works, this
+   confirms multi-stage.
+3. Skip all 8. Sanity check — what's the maximum surface area we
+   can take out without crashing / breaking something unrelated.
+
+The difference between blackout-still-happens-then-stops vs
+blackout-never-starts vs scene-stays-frozen-at-a-fixed-exposure
+will tell us precisely which role each dispatch plays in the
+adaptation loop.
+
+## Phase 19c — dispatch and draw skip tests (null across the board)
+
+After Phase 19b identified 8 compute pipelines and 101 graphics
+pipelines that fire during dim and go silent at lift, we built
+`ShouldSkipDriveclubDispatch` / `ShouldSkipDriveclubDraw` to turn
+matching pipelines into no-ops via two new env knobs:
+
+- `SHADPS4_DC_DISPATCH_SKIP=0xHH,0xII,…`
+- `SHADPS4_DC_DRAW_SKIP=0xHH,0xII,…`
+
+Both gated by the race window + `NUKE_AFTER_ARM` so pre-race draws
+that share a pipeline hash stay intact.
+
+Test matrix, all under the `NUKE_AFTER_ARM=3` gate so only
+post-race-load dispatches/draws get skipped:
+
+| # | skipped                                          | observed                      |
+|---|--------------------------------------------------|-------------------------------|
+| 1 | 2 (1,1,1) compute scalar writers                  | baseline, blackout 7 s lift   |
+| 2 | all 8 dim-only compute pipelines                  | baseline + HUD timer glitch, blackout 7 s |
+| 3 | 4 HDR-writing dim-only graphics draws             | baseline, blackout 10 s       |
+| 4 | highest-rate dim-only draw (0x4a8b..e10b, 513×)   | baseline, blackout 25 s       |
+| 5 | **all 101 dim-only graphics draws**                | baseline, blackout 24 s lift  |
+
+Result across the matrix: **the dim runs on its own schedule
+regardless**. Not one of the pipelines that visibly stops at lift
+is the thing that causes the lift.
+
+### Durable conclusion
+
+The 8 dim-only compute + 101 dim-only graphics pipelines are
+*correlated* with the dim phase — they happen while adaptation is
+in progress and stop when it converges. But they're downstream
+effects, not the driver. Taking every one of them out doesn't
+change when or how the dim ends.
+
+Combined with Phases 16–18 ruling out texture content, UBO random
+fill, and push constants, the honest frame is:
+
+- The dim is somewhere in shader-reachable state, **but it's
+  co-located with load-bearing state** (matrices, descriptor
+  pointers) that crashes when the probe touches it. Random-fill
+  is too coarse to separate the dim field from the crash fields.
+- **Or** the dim lives in state that is not part of the per-draw
+  Vulkan surface at all — pipeline-creation-time state, blend
+  constants pulled from registers, scanout metadata, compute
+  output buffers that flow through non-descriptor paths, etc.
+
+Every probe we can build with env-var knobs has been tried.
+Meaningful new runtime probes would require:
+
+- per-offset UBO surgery (one 4-byte flip per run; dozens of
+  runs)
+- a fixed-function state diff harness (dump blend state per draw
+  across dim / bright submits)
+- a compute-output replay probe (overwrite SSBO after dispatch
+  rather than before)
+
+All three are real work, none are env-var toggles.
+
+### Commit state at end of Phase 19c
+
+`src/video_core/renderer_vulkan/vk_rasterizer.cpp` carries:
+
+- `DriveclubDrawKind::Compute` + its mask bit
+- `IsDcDispatchLogEnabled` / `NoteDriveclubDispatchlog`
+- `GetDcDispatchSkipPipes` / `ShouldSkipDriveclubDispatch` +
+  call-site at both Direct and Indirect dispatches
+- `GetDcDrawSkipPipes` / `ShouldSkipDriveclubDraw` + call-site at
+  both Draw and DrawIndirect
+
+`scripts/run_driveclub_overlay.sh` passes through
+`SHADPS4_DC_DISPATCHLOG`, `SHADPS4_DC_DISPATCH_SKIP`, and
+`SHADPS4_DC_DRAW_SKIP`.
+
+Zero emulator behaviour change when none of the env vars are set.
+
+A full baseline run log (pre-race + dim + lift + bright, 100 MB)
+is archived at
+`tmp/dc-logs/baseline-dim-lift_17-24-06_start_17-24-22_end.txt`
+so the diff analysis can be re-run or extended without needing the
+user to capture another wall-clock-timed session.
+
+
+## Phase 20 — shader dump analysis + the tonemap-is-inline discovery
+
+### Setup
+
+- `SHADPS4_DC_DISPATCHLOG` extended to log the compute shader's
+  `info.pgm_hash` alongside the pipeline hash, so each dispatch line
+  cleanly maps to a dumped `cs_0x<pgm_hash>_<perm>.spv` file.
+- Pipeline cache for `CUSA00003` snapshot-moved aside so shadPS4
+  recompiles every shader on the next launch and dumps all of them.
+  `patch_shaders` in the game config was already `true`, so any
+  `.spv` dropped into `shader/patch/` is picked up automatically.
+- `sceVideoOutAdjustColor` log extended to print the full 16-byte
+  `SceVideoOutColorSettings` payload (gamma + 3 reserved dwords) to
+  see if the game sneaks an animated value into the reserved slots
+  that shadPS4 otherwise ignores.
+
+### First real find: the (1,1,1) auto-exposure shader
+
+After a full recompile pass, 112 unique compute shaders dumped. The
+`(1,1,1)` scalar-writer `cs_0x00000000eea18ba7_0.spv` disassembles
+cleanly as a classic histogram-based auto-exposure reduction:
+
+- `ssbo_1` is a 256-entry luminance histogram (input).
+- `ssbo_2` is a parameter block: adapt rate, min/max clamps, target
+  mid-grey, previous-frame exposure — the usual eye-adaptation
+  controls.
+- `ssbo_3` is the output, one `vec2<f32>` written as two u32 stores
+  at `buf2_dword_off + 0` and `+1`. The first u32 is the adapted
+  exposure (after `Fma + Log2 + clamp`), the second is the last
+  max-luminance sample.
+
+The bit-field unpacking of `push.buf_offsets0` into three 8-bit
+slots, the `FMA(0.0352941, index, -4.0) → FMul 3.32192802 → Exp2`
+sequence (log10-to-log2 conversion on the histogram index), and
+the `FDiv mid_grey / avg_lum → Log2 → Fma(adapt_rate, ..., prev) →
+Exp2` chain are unambiguous auto-exposure. Nothing hidden in the
+math.
+
+### First test: patch the exposure writer
+
+Wrote a minimal GLSL replacement that keeps the same descriptor
+layout (SSBO 0/1/2) and the same push-constant packing, but writes
+`floatBitsToUint(1.0f)` to both output slots instead of the adapted
+value. Compiled with `glslangValidator -V --target-env vulkan1.3`,
+dropped at
+`~/.local/share/shadPS4/shader/patch/cs_0x00000000eea18ba7_0.spv`,
+pipeline cache wiped again to force the patch-aware
+`CompileModule()` path (`GetShaderPatch` is only consulted on fresh
+compile — the disk cache bypasses it).
+
+Result: blackout 17:47:34 → 17:48:00, 26 s. **Same behaviour as
+baseline.** The patched shader fires every frame writing `1.0` to
+its output, yet the dim continues on its normal schedule. `ssbo_3`
+is therefore not the path the tonemap reads — or there's a
+redundant writer.
+
+### Second test: shotgun idea vs reality
+
+The user proposed patching all 8 dim-only compute shaders to
+bypass their math as a confirmation. Short-circuited it: Phase 19c
+already ran a *stronger* version via `SHADPS4_DC_DISPATCH_SKIP=`
+listing every one of those 8. Skipping means no writes at all;
+patching to constants is a subset (writes *something*, but not the
+computed value). Neither shifted the dim. Patching the other 7
+wouldn't change the outcome and each would need bespoke GLSL to
+match its SSBO / image / sampler layout.
+
+### Third test: VideoOutAdjustColor reserved fields
+
+3992 calls across a full race with blackout + lift. Every payload:
+
+    gamma=0.5 reserved=[0x3f800000, 0xe484a0, 0x20]
+
+Zero variation. `reserved[0]` is a constant `1.0f`, `reserved[1]`
+is a fixed guest-memory pointer, `reserved[2]` is constant 32. No
+animated second-gamma / second-brightness hidden in there. The
+videoout API is not the dim path.
+
+### The load-bearing conclusion
+
+Driveclub has **no separate tonemap pass** in the graphics
+pipeline. Scene geometry pipelines write directly to the visible
+composite `0x500cdd0000` as part of the MRT G-buffer draw — the
+three writes-to-composite-alone pipelines we'd previously suspected
+for tonemap (`0x2bd7..ae2`, `0xadd2..da9`, `0xe6e4..d99`) are the
+HUD/UI compositors (already confirmed by texnuke breaking the HUD).
+
+So every material shader has the exposure / fade multiplier baked
+in inline, reading the dim scalar from a shared UBO or SSBO that's
+bound to most scene draws. The 101 "dim-only" graphics pipelines
+from Phase 19b are various cars / props / environmental meshes
+that all see that shared value.
+
+### Reframing the attack surface
+
+Every shader-reachable surface has now been cleared except a
+**single UBO offset inside a shared scene-constants buffer**. That
+offset is read by hundreds of scene material shaders and baked
+into their fragment output. Any broad probe of that UBO crashes
+because it co-hosts matrices and descriptor pointers. Every
+previous null result (texture nukes, UBO smashes, push-constant
+rewrites, dispatch skips, draw skips, exposure-shader patches)
+falls out of this single constraint: we've been probing *around*
+that offset, not at it.
+
+### Planned Phase 21 — fragment-shader inline exposure sweep
+
+Approach:
+
+1. Pick the top three MRT-writing pipelines (by draw count) from
+   the clean baseline log.
+2. Walk each `[dc-pipemap]` entry to resolve its fragment-shader
+   pgm_hash, and pull the matching `fs_0x<pgm_hash>_*.spv` from
+   the dumps.
+3. Disassemble each; find the final `OpStore` to the colour output
+   `OpVariable` tagged `RenderTargetIndex 0` (that's the write to
+   `0x500cdd0000`). Trace backwards to the multiplicand chain and
+   identify every UBO field that multiplies into it.
+4. Patch one fs shader: replace each candidate UBO-read with a
+   constant (`1.0f` in the exposure slot, identity for everything
+   else). Compile and drop in `shader/patch/`. Run the race.
+5. Observe: for the meshes drawn by that specific pipeline, does
+   the dim disappear? If yes — we've found the field and its byte
+   offset in the UBO. Walk back to where that UBO address is
+   written (game-side) and we're out.
+6. "Shotgun" form of the same: apply the patch to all top-N most-
+   used material fs shaders at once. If dim disappears on all
+   patched pipelines simultaneously, it is definitively a shared-
+   UBO inline multiplier; then remove patches one-by-one to find
+   the minimal set.
+
+This keeps iteration fast (shader patch files, no emulator
+rebuild) once the first mapping is done.
+
+## Phase 21 — mapping fragment shaders to the real flip buffer
+
+### Setup
+
+Full pipeline cache wipe + shader-dumps wipe + empty patch dir so
+every shader is recompiled fresh. Run with `SHADPS4_DC_DRAWLOG=1
+SHADPS4_DC_DISPATCHLOG=1` only, no mutation. Fresh recompile fires
+the `[dc-pipemap]` logger for every graphics pipeline, giving us a
+complete map from pipeline hash to per-stage shader pgm_hashes.
+
+Run stats: 440 pipemap entries, 1510 fs shaders + 510 cs shaders
+dumped, timeline covers 64 s. Blackout 18:07:30..18:07:40 (10 s),
+user-reported.
+
+### The LogicalStage number gotcha
+
+`[dc-pipemap]` prints `stages=N=0x...` using LogicalStage indexing,
+not the Stage enum used in dump filenames. Correct mapping:
+
+    LogicalStage::Fragment            = 0   ← dump prefix "fs_"
+    LogicalStage::TessellationControl = 1
+    LogicalStage::TessellationEval    = 2
+    LogicalStage::Vertex              = 3   ← dump prefix "vs_"
+    LogicalStage::Geometry            = 4
+    LogicalStage::Compute             = 5
+
+My first pass took `stages[3]` as fragment and ended up with
+vertex-shader hashes. Correct stage-0 lookup yields real fragment
+shaders.
+
+### Pipelines writing to the actual flip buffers
+
+`sceVideoOutRegisterBuffers` says the presented frame comes from
+`0x5000900000` and `0x5000108000`. `0x500cdd0000` that earlier
+phases kept returning to is actually a G-buffer MRT target, not
+what the user sees.
+
+Drawlog filter `rts == 0x5000900000 OR 0x5000108000, depth=no`
+yields 14 unique pipelines. Crossed against `[dc-pipemap]` for
+their fragment pgm_hash:
+
+**Always-on (fires pre + dim + bright — candidate tonemap / final composite):**
+
+    pipeline            fs hash        pre  dim  bright  notes
+    0x27666d94b4423505  0xf93edfcf      517  338  760    2 ssbo + 1 img, 9 samples
+    0x652a18722d6b6326  0x78662cab      517  338  760    same structure, variant
+    0x20df10c7ad503b04  0x914c1f74      496  338  760    1920×1080 Bc7Srgb photo compositor
+    0x1c2223026ec47d56  0xcf007151      155  338  760    2 ssbo + 5 img, 10 samples — biggest
+
+**In-race-only (pre=0 — kick in at race start, candidate dim applier):**
+
+    pipeline            fs hash        pre  dim  bright  notes
+    0x0d3e2852f666c342  0xcc3e3973      0    324  760    2 samples, 8 FMul
+    0x679ef877c9ddbadd  0x0aff1952      0    324  760    1 sample, 4 FMul (also used by 0x64d30a63381f04b6)
+    0xa58dd401e0038afd  0xae595320      0    324  760    1 sample, 3 FMul — simplest
+    0x71ffc1def01f4747  0x1ddb9986      0    324  760    2 samples, 7 FMul
+
+**None of the 4 in-race-only fs shaders contain Exp2 or Log2.**
+So the dim is not applied through classic `pow(x, gamma)` tonemap
+math in these compositors. It's either:
+
+- pre-multiplied from a `ssbo_1` scalar bound across these
+  pipelines, or
+- applied upstream (before reaching the flip-buffer composite) and
+  the in-race-only shaders just do simple alpha-blend of HUD /
+  overlays on top of an already-dimmed scene.
+
+Same story for the four always-on compositors — zero Exp2/Log2.
+The tonemap either is done in **compute** and the fragment shaders
+just sample its output, or the exposure multiplier is in a
+**LUT-sample** path (no math ops visible, just texture lookup).
+
+### Where we stand
+
+Completed mapping — we now know the exact fragment-shader pgm_hashes
+of every pipeline that writes the frame the user sees. The path
+the scene pixels take is:
+
+- G-buffer MRT writes at `0x500cdd0000 / ABE / D5C` (hundreds of material shaders)
+- Deferred-lighting / tonemap → HDR composite (TBD — probably compute)
+- Final composite into flip buffer (`0x5000900000 / 108000`) via
+  the 8 fs shaders named above
+- Presenter blits flip buffer to swapchain
+
+The dim happens somewhere in the HDR→SDR step, and it is NOT in
+the 8 flip-buffer fragment shaders (no exp/log tonemap math, only
+alpha-blend compositing of pre-baked input).
+
+### Saved artefacts for next session
+
+- Full baseline log (100 MB, 440 pipemap + 3465-frame timeline):
+  still at the usual `shad_log.txt` path (mtime 18:07:59).
+- All 1510 fragment shader SPIR-V dumps + 510 compute:
+  `~/.local/share/shadPS4/shader/dumps/`
+- Fragment-shader hash shortlist (in-race-only and always-on flip
+  writers) documented in the tables above.
+- Pipeline cache *snapshot* backup at
+  `cache/CUSA00003.snapshot-phase21-<ts>` in case cache state
+  matters for debugging reproducibility.
+
+### Planned Phase 22 — hunting the tonemap among compute
+
+Next concrete move: search cs_*.spv for shaders that
+
+- Write into a storage buffer whose address matches `fs_img0` of any
+  of the 8 flip-writer fragment shaders (they read an HDR
+  intermediate — that intermediate is the compute output)
+- Use Exp2/Log2 + multiplies on read values (classic tonemap math)
+
+The existing `[dc-dispatchlog]` already carries `pipeline=... shader=...`
+for every compute dispatch, so we can cross-reference with the
+draw order inside a submit: the compute whose output is read by the
+immediately-following graphics draw that writes the flip buffer is
+the tonemap.
+
+If that lands us at a cs_*.spv with exposure math, we patch *that*
+shader to hold exposure at 1.0 and confirm the dim stops.
+
+### Commit state at end of Phase 21
+
+- `vk_rasterizer.cpp` gains `NoteDriveclubDispatchlog(cs_hash, shader_hash, dim_x, dim_y, dim_z)` signature (shader hash added).
+- `video_out.cpp` `sceVideoOutAdjustColor` log now prints the full 16-byte
+  color-settings payload.
+- No behaviour change when no `SHADPS4_DC_*` env var is set.

@@ -405,7 +405,13 @@ s32 PS4_SYSV_ABI sceVideoOutAdjustColor(s32 handle, const SceVideoOutColorSettin
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
-    LOG_INFO(Lib_VideoOut, "sceVideoOutAdjustColor: handle={} gamma={}", handle, settings->gamma);
+    // Log the whole payload so we see any data the game stores in the
+    // "reserved" slots that the official docs ignore but might still
+    // carry an animated field.
+    const u32* raw = reinterpret_cast<const u32*>(settings);
+    LOG_INFO(Lib_VideoOut,
+             "sceVideoOutAdjustColor: handle={} gamma={} reserved=[{:#x},{:#x},{:#x}]",
+             handle, settings->gamma, raw[1], raw[2], raw[3]);
     presenter->GetPPSettingsRef().gamma = settings->gamma;
     Vulkan::NoteDriveclubVideoOutGamma(settings->gamma);
     return ORBIS_OK;
