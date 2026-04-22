@@ -63,6 +63,78 @@ struct DriveclubRaceGateSubmitState {
 
 std::atomic<u64> g_driveclub_submit_index{};
 std::atomic<u32> g_driveclub_race_window{};
+// Hash of the pipeline currently being issued through Draw()/DrawIndirect().
+// Set at Draw entry, read by BindTextures/texdump so each dumped texture
+// can be attributed to the pipeline that bound it. GpuComm is single-
+// threaded so atomic ordering is not a concern here.
+std::atomic<u64> g_driveclub_current_pipeline_hash{};
+// Counts every time the race-window gate latches. Menus/panorama also
+// arm the gate, so the true race-start is typically arm #3 or #4. The
+// texnuke probe reads this to optionally skip earlier arms.
+std::atomic<u32> g_driveclub_arm_count{};
+
+// Classification of the draw currently in flight based on its RT set.
+// Set by the Draw/DrawIndirect entry points so BindTextures-time hooks
+// can decide whether to skip a texture write.
+enum class DriveclubDrawKind : u8 {
+    Other = 0,   // unclassified / doesn't match scene or post-fx patterns
+    Scene = 1,   // writes HDR or G-buffer with depth
+    PostFx = 2,  // single-RT fullscreen post-fx or tonemap target
+    Ui = 3,      // draws into the visible composite alone (HUD/UI)
+};
+std::atomic<u8> g_driveclub_current_draw_kind{static_cast<u8>(DriveclubDrawKind::Other)};
+
+DriveclubDrawKind ClassifyDriveclubDraw(const AmdGpu::Regs& regs) {
+    // Count live color buffers + collect addresses.
+    std::array<VAddr, 8> rts{};
+    u32 rt_count = 0;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col = regs.color_buffers[cb];
+        if (col) {
+            rts[rt_count++] = col.Address();
+        }
+    }
+    const bool has_depth = regs.depth_buffer.DepthValid();
+
+    if (rt_count == 0) {
+        return DriveclubDrawKind::Other;
+    }
+
+    // MRT G-buffer: 3+ RTs including the visible composite + friends,
+    // with depth on. Produces scene data.
+    if (rt_count >= 3 && has_depth) {
+        bool has_visible = false;
+        bool has_abe = false;
+        bool has_d5c = false;
+        for (u32 i = 0; i < rt_count; ++i) {
+            has_visible |= (rts[i] == 0x500cdd0000ull);
+            has_abe     |= (rts[i] == 0x500abe0000ull);
+            has_d5c     |= (rts[i] == 0x500d5c8000ull);
+        }
+        if (has_visible && has_abe && has_d5c) {
+            return DriveclubDrawKind::Scene;
+        }
+    }
+
+    if (rt_count == 1) {
+        const VAddr addr = rts[0];
+        // Known scene-HDR targets with depth on -> scene lighting /
+        // deferred passes. Without depth -> post-fx fullscreen.
+        if (addr == 0x5009688000ull || addr == 0x5008130000ull) {
+            return has_depth ? DriveclubDrawKind::Scene : DriveclubDrawKind::PostFx;
+        }
+        // Visible composite alone = HUD / UI compositor.
+        if (addr == 0x500cdd0000ull) {
+            return DriveclubDrawKind::Ui;
+        }
+        // All other single-RT fullscreen addresses are post-fx buffers
+        // (0x500fdd0000, 0x5000108000, 0x5000900000, 0x509a400000,
+        // 0x5015770000, 0x501abf8000, etc).
+        return DriveclubDrawKind::PostFx;
+    }
+
+    return DriveclubDrawKind::Other;
+}
 std::atomic<u64> g_driveclub_gamma_hint_until_submit{};
 std::mutex g_driveclub_gate_mutex;
 DriveclubRaceGateSubmitState g_driveclub_gate_state{};
@@ -155,9 +227,10 @@ void NoteDriveclubRaceGateCandidate(const GraphicsPipeline* pipeline, const AmdG
 
     if (state.num_hashes >= kDriveclubRaceGateMinHashes &&
         g_driveclub_race_window.exchange(kDriveclubRaceWindowSubmits) == 0) {
+        const u32 n = g_driveclub_arm_count.fetch_add(1) + 1;
         LOG_INFO(Render_Vulkan,
-                 "[dc-gate] armed submit={} hashes={} visible=true hdr=true depth=true",
-                 submit_index, state.num_hashes);
+                 "[dc-gate] armed#{} submit={} hashes={} visible=true hdr=true depth=true",
+                 n, submit_index, state.num_hashes);
     }
 }
 
@@ -270,7 +343,7 @@ void NoteDriveclubDrawlog(const GraphicsPipeline* pipeline, const AmdGpu::Regs& 
 // four MRT-writing "blackout" pipelines plus their "recovery" counterparts
 // that Phase 12's drawlog bisect flagged as the likely candidates.
 
-constexpr std::array<u64, 9> kDcUboLogPipelines{
+constexpr std::array<u64, 13> kDcUboLogPipelines{
     0x3ff0fc8f05bc302dull, // blackout MRT-writer, early-only (from Phase 12 diff)
     0xd14226a181106f7eull, // recovery counterpart, late-only
     0xb98e78a7a28007ceull, // race-window MRT-writer (both phases)
@@ -284,6 +357,17 @@ constexpr std::array<u64, 9> kDcUboLogPipelines{
     0x2bd7c53265cadae2ull,
     0xadd2ec4587065da9ull,
     0xe6e42747689b5d99ull,
+    // Phase 15 Round 15d — binders of the five user-picked Bc1RgbaSrgb
+    // vignette-mask candidates. The first two draw into the HDR alt
+    // primary (0x5008130000) while sampling a small Bc1 texture, which
+    // is the signature of a vignette / lens-dirt / mask compositor
+    // layering onto the scene before tonemap. The other two are MRT
+    // G-buffer writers that sample a 1024x1024 Bc1 — probably a
+    // material sampler (less likely dim drivers, kept for parity).
+    0xc7fd16555c9913a5ull, // binds 0x5003831e00  128x128 Bc1 -> HDR alt
+    0xaab6634a8d4573f0ull, // binds 0x509b821a00  256x256 Bc1 -> HDR alt
+    0x145c84476cb9391cull, // binds 0x50b95d6c00  256x256 Bc1 -> MRT G-buf
+    0x5fccbdcf0d968d11ull, // binds 0x5029e8f100 1024x1024 Bc1 -> MRT G-buf
 };
 
 bool IsDcUboLogEnabled() {
@@ -755,6 +839,432 @@ const std::string& DcTexDumpDir() {
     return dir;
 }
 
+// Driveclub texture nuker. Enable with either of:
+//   SHADPS4_DC_TEX_NUKE_ADDRS=0xAAAAA,0xBBBBB,...
+//   SHADPS4_DC_TEX_NUKE_PIPES=0xHHHH,0xIIII,...
+// (both accepted together; any match triggers the nuke.)
+//
+// For matching textures, overwrites the full guest-size range with a
+// repeating 0xDEADBEEF pattern every time the texture binds during the
+// race window. That's "every frame" effectively — the write survives
+// any engine-side re-upload because we clobber at bind-time, after
+// the game's own writes. The nuke propagates through the same
+// page-fault invalidation path that UBO nuke proved works.
+//
+// Use case: binary-search the set of scene textures to find the
+// blackout/vignette mask. Batch several addresses at once; if the
+// blackout is unchanged the mask is not in the batch.
+const std::unordered_set<u64>& GetDcTexNukeAddrs() {
+    static const std::unordered_set<u64> set = [] {
+        std::unordered_set<u64> s;
+        const char* env = std::getenv("SHADPS4_DC_TEX_NUKE_ADDRS");
+        if (!env || !env[0]) return s;
+        std::string in = env;
+        size_t pos = 0;
+        while (pos < in.size()) {
+            const size_t end = in.find(',', pos);
+            std::string tok = in.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!tok.empty()) {
+                const u64 v = std::strtoull(tok.c_str(), nullptr, 0);
+                if (v) s.insert(v);
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        if (!s.empty()) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-texnuke] enabled for {} addresses (SHADPS4_DC_TEX_NUKE_ADDRS)",
+                     s.size());
+        }
+        return s;
+    }();
+    return set;
+}
+
+const std::unordered_set<u64>& GetDcTexNukeSkipPipes() {
+    static const std::unordered_set<u64> set = [] {
+        std::unordered_set<u64> s;
+        const char* env = std::getenv("SHADPS4_DC_NUKE_SKIP_PIPES");
+        if (!env || !env[0]) return s;
+        std::string in = env;
+        size_t pos = 0;
+        while (pos < in.size()) {
+            const size_t end = in.find(',', pos);
+            std::string tok = in.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!tok.empty()) {
+                const u64 v = std::strtoull(tok.c_str(), nullptr, 0);
+                if (v) s.insert(v);
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        if (!s.empty()) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-texnuke] skip list has {} pipelines (SHADPS4_DC_NUKE_SKIP_PIPES)",
+                     s.size());
+        }
+        return s;
+    }();
+    return set;
+}
+
+const std::unordered_set<u64>& GetDcTexNukePipes() {
+    static const std::unordered_set<u64> set = [] {
+        std::unordered_set<u64> s;
+        const char* env = std::getenv("SHADPS4_DC_TEX_NUKE_PIPES");
+        if (!env || !env[0]) return s;
+        std::string in = env;
+        size_t pos = 0;
+        while (pos < in.size()) {
+            const size_t end = in.find(',', pos);
+            std::string tok = in.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            if (!tok.empty()) {
+                const u64 v = std::strtoull(tok.c_str(), nullptr, 0);
+                if (v) s.insert(v);
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        if (!s.empty()) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-texnuke] enabled for {} pipelines (SHADPS4_DC_TEX_NUKE_PIPES)",
+                     s.size());
+        }
+        return s;
+    }();
+    return set;
+}
+
+bool IsDcTexNukeAllEnabled() {
+    static const bool on = [] {
+        const char* env = std::getenv("SHADPS4_DC_TEX_NUKE_ALL");
+        const bool v = env && env[0] == '1' && env[1] == '\0';
+        if (v) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-texnuke] ALL-texture nuke enabled (SHADPS4_DC_TEX_NUKE_ALL=1)");
+        }
+        return v;
+    }();
+    return on;
+}
+
+// Selects which draw kinds (as classified by ClassifyDriveclubDraw) are
+// eligible for nuking. Default is "scene" — G-buffer + HDR-with-depth.
+// Post-fx, UI, and unclassified draws are skipped by default so the
+// tonemap/UI path stays intact.
+u32 GetDcNukeKindMask() {
+    static const u32 mask = [] {
+        const char* env = std::getenv("SHADPS4_DC_NUKE_KIND");
+        if (!env || !env[0]) {
+            return 1u << static_cast<u32>(DriveclubDrawKind::Scene);
+        }
+        u32 m = 0;
+        std::string s = env;
+        for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        auto add = [&](const char* tok, DriveclubDrawKind k) {
+            if (s.find(tok) != std::string::npos) m |= 1u << static_cast<u32>(k);
+        };
+        if (s.find("all") != std::string::npos) {
+            m = 0xFFFFFFFFu;
+        } else {
+            add("scene",  DriveclubDrawKind::Scene);
+            add("postfx", DriveclubDrawKind::PostFx);
+            add("ui",     DriveclubDrawKind::Ui);
+            add("other",  DriveclubDrawKind::Other);
+        }
+        LOG_INFO(Render_Vulkan, "[dc-texnuke] kind mask = 0x{:x} ({})", m, env);
+        return m;
+    }();
+    return mask;
+}
+
+// Runtime knobs to relax each of the defensive filters. Default values
+// produce the "safe" behaviour we converged on (colour scene, nothing
+// else touched). Raising a knob re-includes that category so we can
+// see whether the blackout driver lives there.
+u32 GetDcNukeMinDim() {
+    static const u32 v = [] {
+        const char* env = std::getenv("SHADPS4_DC_NUKE_MIN_DIM");
+        const u32 def = 128u;
+        if (!env || !env[0]) return def;
+        return static_cast<u32>(std::strtoul(env, nullptr, 0));
+    }();
+    return v;
+}
+
+// Maximum width/height cap; default 0 means unlimited. Combined with
+// SHADPS4_DC_NUKE_MIN_DIM this brackets a size range: tests like
+//   MIN_DIM=32 MAX_DIM=63 → only 32..63-px textures get nuked
+// so we can rotate in small sub-batches without collapsing the scene.
+u32 GetDcNukeMaxDim() {
+    static const u32 v = [] {
+        const char* env = std::getenv("SHADPS4_DC_NUKE_MAX_DIM");
+        if (!env || !env[0]) return 0u;
+        return static_cast<u32>(std::strtoul(env, nullptr, 0));
+    }();
+    return v;
+}
+
+// Format substring match. Empty = no filter. Any texture whose vk::Format
+// name contains this substring is nuked; everything else is skipped
+// (when this knob is set). e.g. SHADPS4_DC_NUKE_FORMAT=Bc4 targets
+// BC4 normal-maps; SHADPS4_DC_NUKE_FORMAT=Sfloat targets float data
+// textures once INCLUDE_DATA=1 is also set.
+const std::string& GetDcNukeFormatFilter() {
+    static const std::string s = [] {
+        const char* env = std::getenv("SHADPS4_DC_NUKE_FORMAT");
+        return std::string(env ? env : "");
+    }();
+    return s;
+}
+
+u32 GetDcNukeMaxAspect() {
+    static const u32 v = [] {
+        const char* env = std::getenv("SHADPS4_DC_NUKE_MAX_ASPECT");
+        const u32 def = 8u;
+        if (!env || !env[0]) return def;
+        return static_cast<u32>(std::strtoul(env, nullptr, 0));
+    }();
+    return v;
+}
+
+bool GetDcNukeIncludeData() {
+    static const bool v = [] {
+        const char* env = std::getenv("SHADPS4_DC_NUKE_INCLUDE_DATA");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return v;
+}
+
+bool GetDcNukeIncludeGpuMod() {
+    static const bool v = [] {
+        const char* env = std::getenv("SHADPS4_DC_NUKE_INCLUDE_GPU_MOD");
+        return env && env[0] == '1' && env[1] == '\0';
+    }();
+    return v;
+}
+
+u32 GetDcNukeAfterArm() {
+    static const u32 n = [] {
+        const char* env = std::getenv("SHADPS4_DC_NUKE_AFTER_ARM");
+        if (!env || !env[0]) return 0u;
+        const auto v = static_cast<u32>(std::strtoul(env, nullptr, 0));
+        if (v > 0) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-texnuke] gated to fire only after gate arm #{}", v);
+        }
+        return v;
+    }();
+    return n;
+}
+
+bool MaybeNukeDriveclubTexture(const VideoCore::Image& image) {
+    const auto& addr_set = GetDcTexNukeAddrs();
+    const auto& pipe_set = GetDcTexNukePipes();
+    const bool nuke_all = IsDcTexNukeAllEnabled();
+    if (addr_set.empty() && pipe_set.empty() && !nuke_all) {
+        return false;
+    }
+    if (!IsDriveclubGuardEnabled()) {
+        return false;
+    }
+    if (g_driveclub_race_window.load() == 0) {
+        return false;
+    }
+    // Optional: skip early gate arms (menu/panorama) and only fire once
+    // we're past the N-th arm.
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return false;
+    }
+    const auto& info = image.info;
+    if (info.guest_address == 0 || info.guest_size == 0) {
+        return false;
+    }
+
+    // SHADPS4_DC_NUKE_INCLUDE_GPU_MOD=1 re-includes images the GPU has
+    // written to (render targets being re-sampled as textures). Safe
+    // default is to skip them — nuking breaks the tonemap / post-fx
+    // sampling.
+    if (!GetDcNukeIncludeGpuMod() &&
+        True(image.flags & VideoCore::ImageFlagBits::GpuModified)) {
+        return false;
+    }
+
+    // SHADPS4_DC_NUKE_MIN_DIM / _MAX_DIM bracket the size range.
+    // Defaults: min=128, max=unlimited. Set MAX_DIM to narrow the
+    // upper bound and rotate through small sub-batches.
+    const u32 min_dim = GetDcNukeMinDim();
+    if (min_dim > 0 &&
+        (info.size.width < min_dim || info.size.height < min_dim)) {
+        return false;
+    }
+    const u32 max_dim = GetDcNukeMaxDim();
+    if (max_dim > 0 &&
+        (info.size.width > max_dim || info.size.height > max_dim)) {
+        return false;
+    }
+    // SHADPS4_DC_NUKE_MAX_ASPECT caps long/short edge ratio (default 8).
+    // Anything more extreme is usually a data strip. Set to 0 to
+    // disable the check.
+    const u32 max_aspect = GetDcNukeMaxAspect();
+    if (max_aspect > 0) {
+        const u32 long_edge = std::max(info.size.width, info.size.height);
+        const u32 short_edge = std::min(info.size.width, info.size.height);
+        if (short_edge > 0 && long_edge / short_edge > max_aspect) {
+            return false;
+        }
+    }
+    // SHADPS4_DC_NUKE_INCLUDE_DATA=1 re-includes non-colour float/int
+    // formats (R16Sfloat, HDR packed, etc). Default skip because these
+    // usually feed tonemap / exposure / metering paths and nuking
+    // them collapses the output.
+    // SHADPS4_DC_NUKE_FORMAT=<substr> — when set, only nuke textures
+    // whose vk::Format name contains this substring. Disables all
+    // other format-based filters.
+    const std::string& fmt_filter = GetDcNukeFormatFilter();
+    if (!fmt_filter.empty()) {
+        const std::string fmt_name = vk::to_string(info.pixel_format);
+        if (fmt_name.find(fmt_filter) == std::string::npos) {
+            return false;
+        }
+    } else if (!GetDcNukeIncludeData()) {
+        switch (info.pixel_format) {
+        case vk::Format::eR16Sfloat:
+        case vk::Format::eR32Sfloat:
+        case vk::Format::eR16Unorm:
+        case vk::Format::eR16Snorm:
+        case vk::Format::eR16Uint:
+        case vk::Format::eR16Sint:
+        case vk::Format::eR32Uint:
+        case vk::Format::eR32Sint:
+        case vk::Format::eR16G16Sfloat:
+        case vk::Format::eR32G32Sfloat:
+        case vk::Format::eR16G16Unorm:
+        case vk::Format::eR16G16B16A16Sfloat:
+        case vk::Format::eR32G32B32A32Sfloat:
+        case vk::Format::eR32G32B32A32Uint:
+        case vk::Format::eB10G11R11UfloatPack32:
+            return false;
+        default:
+            break;
+        }
+    }
+
+    const auto& skip_pipe_set = GetDcTexNukeSkipPipes();
+    const u64 cur_pipe = g_driveclub_current_pipeline_hash.load();
+    if (skip_pipe_set.count(cur_pipe) != 0) {
+        return false;
+    }
+
+    // Only fire on draw kinds we've been asked to target.
+    const u32 kind_bit = 1u << g_driveclub_current_draw_kind.load();
+    if ((GetDcNukeKindMask() & kind_bit) == 0) {
+        return false;
+    }
+
+    const bool hit_addr = addr_set.count(info.guest_address) != 0;
+    const bool hit_pipe = !pipe_set.empty() && pipe_set.count(cur_pipe) != 0;
+    if (!hit_addr && !hit_pipe && !nuke_all) {
+        return false;
+    }
+
+    // Dedup per guest address: each texture is nuked at most once per
+    // session. This prevents the per-frame multi-megabyte-write
+    // pileup that stalls the emulator when nuke-all is on. If the game
+    // refreshes a texture after our nuke, the fresh copy will be seen
+    // — we accept that tradeoff for speed.
+    static std::mutex seen_mutex;
+    static std::unordered_set<u64> seen_addrs;
+    {
+        std::lock_guard lock{seen_mutex};
+        if (!seen_addrs.insert(info.guest_address).second) {
+            return false;
+        }
+    }
+
+    // Skip likely normal-map / single-channel formats so lighting
+    // direction stays intact and we can still see scene shape.
+    const auto fmt = info.pixel_format;
+    const bool is_normal_like =
+        fmt == vk::Format::eBc4UnormBlock || fmt == vk::Format::eBc4SnormBlock ||
+        fmt == vk::Format::eBc5UnormBlock || fmt == vk::Format::eBc5SnormBlock ||
+        fmt == vk::Format::eBc6HUfloatBlock || fmt == vk::Format::eBc6HSfloatBlock;
+    if (is_normal_like) {
+        return false;
+    }
+
+    // Per-texture random tint via splitmix64 avalanche on the guest
+    // address. Better distribution than a single multiply → colours
+    // spread across the RGB cube instead of clustering in one hue.
+    u64 h = info.guest_address;
+    h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+    h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+    h = h ^ (h >> 31);
+    const u32 r = static_cast<u32>((h >> 0) & 0xFF);
+    const u32 g = static_cast<u32>((h >> 8) & 0xFF);
+    const u32 b = static_cast<u32>((h >> 16) & 0xFF);
+    const u32 rgba = 0xFF000000u | (b << 16) | (g << 8) | r;
+
+    // RGB565 packed word + its duplicated u32 — the BC1 block layout
+    // stores two colours in the first 4 bytes, then 4 bytes of indices.
+    // Setting color_0 == color_1 makes the block decode to a solid
+    // fill regardless of index values.
+    const u16 rgb565 =
+        static_cast<u16>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+    const u32 c565_pair =
+        (static_cast<u32>(rgb565) << 16) | static_cast<u32>(rgb565);
+
+    auto* dst8 = reinterpret_cast<u8*>(info.guest_address);
+    const size_t size = info.guest_size;
+
+    auto fill_u32 = [&](u32 v) {
+        auto* p = reinterpret_cast<u32*>(dst8);
+        const size_t n32 = size / 4;
+        for (size_t i = 0; i < n32; ++i) p[i] = v;
+    };
+
+    const bool is_bc1 = fmt == vk::Format::eBc1RgbUnormBlock ||
+                        fmt == vk::Format::eBc1RgbSrgbBlock ||
+                        fmt == vk::Format::eBc1RgbaUnormBlock ||
+                        fmt == vk::Format::eBc1RgbaSrgbBlock;
+    const bool is_bc3 = fmt == vk::Format::eBc3UnormBlock ||
+                        fmt == vk::Format::eBc3SrgbBlock;
+
+    if (is_bc1) {
+        // 8-byte blocks: [c565 lo, c565 hi, c565 lo, c565 hi, idx0..3]
+        // color_0 == color_1 → entire block decodes to that colour
+        // no matter what indices say.
+        struct Bc1 { u32 colors; u32 indices; } block = {c565_pair, 0u};
+        const size_t blocks = size / 8;
+        auto* p = reinterpret_cast<Bc1*>(dst8);
+        for (size_t i = 0; i < blocks; ++i) p[i] = block;
+    } else if (is_bc3) {
+        // 16-byte blocks: 8-byte alpha + 8-byte BC1 colour.
+        // alpha a0=255, a1=255, any indices → solid 255 alpha.
+        struct Bc3 { u16 a; u16 a_idx_lo; u32 a_idx_hi; u32 colors; u32 indices; };
+        const Bc3 block = {0xFFFFu, 0u, 0u, c565_pair, 0u};
+        const size_t blocks = size / 16;
+        auto* p = reinterpret_cast<Bc3*>(dst8);
+        for (size_t i = 0; i < blocks; ++i) p[i] = block;
+    } else {
+        // Uncompressed 32-bit & BC7 / other compressed formats: fall
+        // back to repeating 4-byte pattern. Not a true solid for BC7
+        // but still produces a per-texture distinctive result.
+        fill_u32(rgba);
+    }
+
+    LOG_INFO(Render_Vulkan,
+             "[dc-texnuke] nuked addr={:#x} size={}x{} fmt={} pipeline={:#018x} "
+             "submit={} arm={}",
+             info.guest_address, info.size.width, info.size.height,
+             vk::to_string(info.pixel_format),
+             g_driveclub_current_pipeline_hash.load(),
+             g_driveclub_submit_index.load(),
+             g_driveclub_arm_count.load());
+    return true;
+}
+
 void MaybeDumpDriveclubTexture(const VideoCore::Image& image) {
     if (!IsDcTexDumpEnabled()) {
         return;
@@ -811,9 +1321,10 @@ void MaybeDumpDriveclubTexture(const VideoCore::Image& image) {
     std::fclose(f);
 
     LOG_INFO(Render_Vulkan,
-             "[dc-texdump] submit={} addr={:#x} size={}x{} pitch={} bits={} "
-             "fmt={} tile={} bytes={} -> {}",
-             submit, info.guest_address, info.size.width, info.size.height,
+             "[dc-texdump] submit={} pipeline={:#018x} addr={:#x} size={}x{} "
+             "pitch={} bits={} fmt={} tile={} bytes={} -> {}",
+             submit, g_driveclub_current_pipeline_hash.load(),
+             info.guest_address, info.size.width, info.size.height,
              info.pitch, info.num_bits, fmt_str,
              static_cast<u32>(info.tile_mode), wrote, path);
 }
@@ -1067,6 +1578,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!pipeline) {
         return;
     }
+    g_driveclub_current_pipeline_hash.store(
+        std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()));
+    g_driveclub_current_draw_kind.store(static_cast<u8>(ClassifyDriveclubDraw(regs)));
     NoteDriveclubRaceGateCandidate(pipeline, regs);
     NoteDriveclubDrawlog(pipeline, regs);
     NoteDriveclubUboLog(pipeline, regs);
@@ -1121,6 +1635,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!pipeline) {
         return;
     }
+    g_driveclub_current_pipeline_hash.store(
+        std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey()));
+    g_driveclub_current_draw_kind.store(
+        static_cast<u8>(ClassifyDriveclubDraw(liverpool->regs)));
     NoteDriveclubRaceGateCandidate(pipeline, liverpool->regs);
     NoteDriveclubDrawlog(pipeline, liverpool->regs);
     NoteDriveclubUboLog(pipeline, liverpool->regs);
@@ -1593,6 +2111,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image = &texture_cache.GetImage(image_id);
             }
             MaybeDumpDriveclubTexture(*image);
+            if (MaybeNukeDriveclubTexture(*image)) {
+                // Page-fault tracking may not catch our own writes into
+                // tracked pages from this same thread, so explicitly
+                // invalidate the region. Next FindImage will re-upload
+                // the nuked bytes from guest memory to the Vulkan image.
+                texture_cache.InvalidateMemory(image->info.guest_address,
+                                               image->info.guest_size);
+            }
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we
                 // need to force general layout on it.
