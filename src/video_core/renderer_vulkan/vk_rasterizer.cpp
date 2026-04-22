@@ -4,8 +4,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <mutex>
+#include <string>
+#include <system_error>
 #include <unordered_set>
 
 #include "common/debug.h"
@@ -264,13 +270,20 @@ void NoteDriveclubDrawlog(const GraphicsPipeline* pipeline, const AmdGpu::Regs& 
 // four MRT-writing "blackout" pipelines plus their "recovery" counterparts
 // that Phase 12's drawlog bisect flagged as the likely candidates.
 
-constexpr std::array<u64, 6> kDcUboLogPipelines{
+constexpr std::array<u64, 9> kDcUboLogPipelines{
     0x3ff0fc8f05bc302dull, // blackout MRT-writer, early-only (from Phase 12 diff)
     0xd14226a181106f7eull, // recovery counterpart, late-only
     0xb98e78a7a28007ceull, // race-window MRT-writer (both phases)
     0x1cdd747ee89204c0ull, // race-window MRT-writer (both phases)
     0x6bde71906ac1af18ull, // race-window MRT-writer (both phases)
     0xf6e5670be11b0009ull, // extra race-window candidate from kDriveclubLaterRaceGatePipelines
+    // Phase 14: single-RT composition passes targeting the visible
+    // composite 0x500cdd0000 with depth=yes. These fire continuously
+    // through the race window and are strong candidates for the
+    // fullscreen fade / tonemap that produces the user-visible dim.
+    0x2bd7c53265cadae2ull,
+    0xadd2ec4587065da9ull,
+    0xe6e42747689b5d99ull,
 };
 
 bool IsDcUboLogEnabled() {
@@ -363,6 +376,302 @@ void NoteDriveclubUboLog(const GraphicsPipeline* pipeline, const AmdGpu::Regs& r
     }
 }
 
+// Driveclub luminance clamp. Enable with env SHADPS4_DC_LUM_CLAMP=<float>.
+//
+// Phase 13 found that pipeline 0xf6e5670be11b0009 consumes a 48-byte UBO
+// at stage=0/stage=2 cb0 whose 4th float is the only value that moves
+// across the race window. Its layout is fully invariant otherwise:
+//   [0]=1.0  [1]=1.0  [2]=0.3  [3]=LUM
+//   [4]=1.0  [5]=0.25 [6]=1.0  [7]=0.25
+//   [8]=0.25 [9]=1.0  [10]=0.25 [11]=1.0
+// During the blackout, LUM climbs monotonically (seen 5.35 -> 13.98 over
+// ~2 s) without ever converging — classic runaway auto-exposure. Vanilla
+// PS4 tops out near 6.5, so anything >6.5 is the emulator-specific bug.
+//
+// This knob lets us prove the UBO is the dim driver by overwriting the
+// 4th float at bind time. The exact signature is matched before the
+// write so we never corrupt some other coincidentally-shaped UBO.
+//
+// Usage:
+//   SHADPS4_DC_LUM_CLAMP=2.0 scripts/run_driveclub_overlay.sh
+// Zero or unset disables the clamp.
+float GetDcLumClampValue() {
+    static const float value = [] {
+        const char* env = std::getenv("SHADPS4_DC_LUM_CLAMP");
+        if (env == nullptr || env[0] == '\0') {
+            return 0.0f;
+        }
+        char* end = nullptr;
+        const float v = std::strtof(env, &end);
+        if (end == env || !std::isfinite(v) || v <= 0.0f) {
+            LOG_WARNING(Render_Vulkan,
+                        "[dc-lumclamp] ignored invalid SHADPS4_DC_LUM_CLAMP='{}'", env);
+            return 0.0f;
+        }
+        LOG_INFO(Render_Vulkan, "[dc-lumclamp] enabled (SHADPS4_DC_LUM_CLAMP={})", v);
+        return v;
+    }();
+    return value;
+}
+
+void MaybeClampDriveclubLuminanceUbo(const GraphicsPipeline* pipeline,
+                                     const AmdGpu::Regs& regs) {
+    const float clamp = GetDcLumClampValue();
+    if (clamp <= 0.0f) {
+        return;
+    }
+    if (!IsDriveclubGuardEnabled()) {
+        return;
+    }
+    if (g_driveclub_race_window.load() == 0) {
+        return;
+    }
+    const u64 pipeline_hash = std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey());
+    if (pipeline_hash != 0xf6e5670be11b0009ull) {
+        return;
+    }
+
+    // Expected invariant layout (12 floats). Match exact bit-patterns;
+    // all constants are representable. Offset 3 is the dynamic slot we
+    // overwrite — it is excluded from the match check.
+    constexpr std::array<float, 12> kExpected{
+        1.0f,  1.0f,  0.3f,  0.0f /* ignored */,
+        1.0f,  0.25f, 1.0f,  0.25f,
+        0.25f, 1.0f,  0.25f, 1.0f,
+    };
+
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& desc : stage->buffers) {
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(*stage);
+            if (vsharp.base_address == 0 || vsharp.GetSize() < 48) {
+                continue;
+            }
+            auto* floats = reinterpret_cast<float*>(vsharp.base_address);
+            bool layout_ok = true;
+            for (size_t i = 0; i < kExpected.size(); ++i) {
+                if (i == 3) {
+                    continue;
+                }
+                if (floats[i] != kExpected[i]) {
+                    layout_ok = false;
+                    break;
+                }
+            }
+            if (!layout_ok) {
+                continue;
+            }
+            if (floats[3] > clamp) {
+                // Log first clamp per submit so we can correlate with
+                // the drawlog without flooding the journal.
+                static std::atomic<u64> last_logged_submit{~0ull};
+                const u64 submit_index = g_driveclub_submit_index.load();
+                const u64 prev = last_logged_submit.exchange(submit_index);
+                if (prev != submit_index) {
+                    LOG_INFO(Render_Vulkan,
+                             "[dc-lumclamp] submit={} pipeline={:#018x} lum={} -> {}",
+                             submit_index, pipeline_hash, floats[3], clamp);
+                }
+                floats[3] = clamp;
+            }
+        }
+    }
+}
+
+// Driveclub exposure-UBO restorer. Enable with env SHADPS4_DC_EXPO_RESTORE=1.
+//
+// Phase 13b: pipelines 0x6bde71906ac1af18 and 0x1cdd747ee89204c0 (both in
+// kDriveclubEarlyGatePipelines) bind a 32-float UBO at stage=1 cb=4 that
+// shows a clean two-phase signature coinciding with the race start:
+//
+//   Bright (pre-race) phase — offsets 24..31 carry:
+//     (292.6, 288.3, 271.3, 13.6, 0.31, 0.31, 0.30, 0.015)
+//   plus off[0]=0.4, off[12]=0, off[16]=0.001.
+//
+//   Dim (post-race-start) phase — offsets 24..31 flip to all zero;
+//   off[0] climbs to 1.0, off[12] flips to 1, off[16] climbs to ~0.59.
+//
+// The transition aligns exactly with the gate re-arm at race start, so
+// whatever the shader does with these fields is almost certainly inside
+// the scene-dim feedback. This probe restores the bright-phase values
+// for offsets 24..31 whenever the UBO looks like it is in the Z phase,
+// leaving off[0]/off[12]/off[16] alone (those flip-flags may be required
+// by other consumers).
+//
+// If the blackout visibly softens with this env on, the dim driver lives
+// in this UBO's "scene scale" block. If not, the UBO is downstream of a
+// broader state change and we pivot.
+bool IsDcExpoRestoreEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_EXPO_RESTORE");
+        const bool on = env != nullptr && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "[dc-exporestore] enabled (SHADPS4_DC_EXPO_RESTORE=1)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+void MaybeRestoreDriveclubExposureUbo(const GraphicsPipeline* pipeline,
+                                      const AmdGpu::Regs& regs) {
+    if (!IsDcExpoRestoreEnabled()) {
+        return;
+    }
+    if (!IsDriveclubGuardEnabled()) {
+        return;
+    }
+    if (g_driveclub_race_window.load() == 0) {
+        return;
+    }
+    const u64 pipeline_hash = std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey());
+    if (pipeline_hash != 0x6bde71906ac1af18ull &&
+        pipeline_hash != 0x1cdd747ee89204c0ull) {
+        return;
+    }
+
+    // Bright-phase reference values captured from submits 423..1465 of
+    // the Phase 13 clamp run. Offsets 24..27 are the RGB+alpha scale
+    // triple and offsets 28..31 are their small-magnitude companion set
+    // that tracks them 1:1 through both phases.
+    constexpr float kNzOff24 = 292.6075f;
+    constexpr float kNzOff25 = 288.2520f;
+    constexpr float kNzOff26 = 271.3029f;
+    constexpr float kNzOff27 = 13.6001f;
+    constexpr float kNzOff28 = 0.3185f;
+    constexpr float kNzOff29 = 0.3137f;
+    constexpr float kNzOff30 = 0.2953f;
+    constexpr float kNzOff31 = 0.0148f;
+
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        u32 cb_idx = 0;
+        for (const auto& desc : stage->buffers) {
+            if (desc.IsSpecial()) {
+                cb_idx++;
+                continue;
+            }
+            if (cb_idx != 4) {
+                cb_idx++;
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(*stage);
+            if (vsharp.base_address == 0 || vsharp.GetSize() < 128) {
+                cb_idx++;
+                continue;
+            }
+            auto* floats = reinterpret_cast<float*>(vsharp.base_address);
+            // Only intervene when we see the Z-phase signature: the RGB
+            // scale triple all exactly zero.
+            if (floats[24] != 0.0f || floats[25] != 0.0f ||
+                floats[26] != 0.0f || floats[27] != 0.0f) {
+                cb_idx++;
+                continue;
+            }
+            floats[24] = kNzOff24;
+            floats[25] = kNzOff25;
+            floats[26] = kNzOff26;
+            floats[27] = kNzOff27;
+            floats[28] = kNzOff28;
+            floats[29] = kNzOff29;
+            floats[30] = kNzOff30;
+            floats[31] = kNzOff31;
+            static std::atomic<u64> last_logged_submit{~0ull};
+            const u64 submit_index = g_driveclub_submit_index.load();
+            const u64 prev = last_logged_submit.exchange(submit_index);
+            if (prev != submit_index) {
+                LOG_INFO(Render_Vulkan,
+                         "[dc-exporestore] submit={} pipeline={:#018x} restored off24..31",
+                         submit_index, pipeline_hash);
+            }
+            cb_idx++;
+        }
+    }
+}
+
+// Driveclub UBO propagation test. Enable with env SHADPS4_DC_UBO_NUKE=1.
+//
+// Writes a very loud garbage pattern (NaN-like bit-pattern 0x7fc0dead,
+// and large magnitude floats) into the entire 32-float UBO at stage=1
+// cb=4 of pipelines 0x6bde71906ac1af18 / 0x1cdd747ee89204c0. The goal
+// is *not* to fix anything — just to confirm whether writes to the
+// guest UBO address at Draw-time actually reach the shader on the GPU.
+//
+// Expected outcomes when this env is on:
+//   - scene glitches catastrophically during race window (write works,
+//     value range matters for any future fix)
+//   - scene unchanged → memory_tracker / buffer_cache snapshotted the
+//     UBO before our hook, and in-place writes at this point are
+//     simply never re-uploaded. In that case the fix has to move to a
+//     different layer (bind-side override, or hook the upstream writer).
+void MaybeNukeDriveclubExposureUbo(const GraphicsPipeline* pipeline,
+                                   const AmdGpu::Regs& regs) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_UBO_NUKE");
+        const bool on = env != nullptr && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "[dc-ubonuke] enabled (SHADPS4_DC_UBO_NUKE=1)");
+        }
+        return on;
+    }();
+    if (!enabled) {
+        return;
+    }
+    if (!IsDriveclubGuardEnabled()) {
+        return;
+    }
+    if (g_driveclub_race_window.load() == 0) {
+        return;
+    }
+    const u64 pipeline_hash = std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey());
+    if (pipeline_hash != 0x6bde71906ac1af18ull &&
+        pipeline_hash != 0x1cdd747ee89204c0ull) {
+        return;
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        u32 cb_idx = 0;
+        for (const auto& desc : stage->buffers) {
+            if (desc.IsSpecial()) {
+                cb_idx++;
+                continue;
+            }
+            if (cb_idx != 4) {
+                cb_idx++;
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(*stage);
+            if (vsharp.base_address == 0 || vsharp.GetSize() < 128) {
+                cb_idx++;
+                continue;
+            }
+            auto* floats = reinterpret_cast<float*>(vsharp.base_address);
+            // Binary search landed on off[16] as the sole race-time
+            // scene-brightness driver. NZ-phase values sit at 0.001;
+            // Z-phase climbs to ~0.59 mean, up to 5.75. Pin it to the
+            // bright value to kill the blackout.
+            floats[16] = 0.001f;
+            static std::atomic<u64> last_logged{~0ull};
+            const u64 submit_index = g_driveclub_submit_index.load();
+            if (last_logged.exchange(submit_index) != submit_index) {
+                LOG_INFO(Render_Vulkan,
+                         "[dc-ubonuke] submit={} pipeline={:#018x} nuked cb4",
+                         submit_index, pipeline_hash);
+            }
+            cb_idx++;
+        }
+    }
+}
+
 // Driveclub torture probe. Enable with env SHADPS4_DC_TORTURE=1.
 // For draws whose color attachments target one of the critical full-res
 // HDR/composite surfaces, substitute specific sampled source textures with
@@ -401,6 +710,112 @@ bool IsTortureEnabled() {
         return on;
     }();
     return enabled;
+}
+
+// Driveclub texture dumper. Enable with env SHADPS4_DC_TEX_DUMP=1.
+//
+// Phase 14: the race-start blackout visually manifests as a specific
+// "dark car static image" overlay. We still don't know which pipeline
+// draws it — our UBO probes keep landing on scene-material state
+// rather than the overlay composition. So: during the race window,
+// on first bind of each unique guest-texture address, dump the raw
+// guest bytes and a metadata line describing format/size/tiling.
+//
+// Output goes to `$HOME/.local/share/shadPS4/texdump/` (inside the
+// distrobox that's /home/akitaonrails/.local/...). Each dump is:
+//   s<submit>_a<addr>_<w>x<h>_<fmt>_tile<mode>.bin
+// plus one `[dc-texdump]` log line per dump so the log acts as an
+// index. De-swizzle happens offline — the bytes are what the game
+// asked the GPU to sample; we just ship them to disk.
+bool IsDcTexDumpEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_TEX_DUMP");
+        const bool on = env != nullptr && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "[dc-texdump] enabled (SHADPS4_DC_TEX_DUMP=1)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+const std::string& DcTexDumpDir() {
+    static const std::string dir = [] {
+        const char* home = std::getenv("HOME");
+        std::string d = fmt::format("{}/.local/share/shadPS4/texdump",
+                                     home ? home : "/tmp");
+        std::error_code ec;
+        std::filesystem::create_directories(d, ec);
+        if (ec) {
+            LOG_WARNING(Render_Vulkan,
+                        "[dc-texdump] failed to create {}: {}", d, ec.message());
+        }
+        return d;
+    }();
+    return dir;
+}
+
+void MaybeDumpDriveclubTexture(const VideoCore::Image& image) {
+    if (!IsDcTexDumpEnabled()) {
+        return;
+    }
+    if (!IsDriveclubGuardEnabled()) {
+        return;
+    }
+    if (g_driveclub_race_window.load() == 0) {
+        return;
+    }
+    const auto& info = image.info;
+    if (info.guest_address == 0 || info.guest_size == 0) {
+        return;
+    }
+    // Sanity: skip absurd sizes and likely-render-target images (we
+    // already know those and they're HDR floats not asset textures).
+    if (info.guest_size > 64u * 1024u * 1024u) {
+        return;
+    }
+    if (info.size.width < 64 || info.size.height < 64) {
+        return;
+    }
+
+    // Dedup per guest-address across the whole session.
+    static std::mutex seen_mutex;
+    static std::unordered_set<u64> seen;
+    {
+        std::lock_guard lock{seen_mutex};
+        if (!seen.insert(info.guest_address).second) {
+            return;
+        }
+    }
+
+    const u64 submit = g_driveclub_submit_index.load();
+    const auto fmt_str = vk::to_string(info.pixel_format);
+    // Vulkan format strings contain characters we want out of a path.
+    std::string clean_fmt;
+    clean_fmt.reserve(fmt_str.size());
+    for (char c : fmt_str) {
+        clean_fmt.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+    }
+    const auto path = fmt::format("{}/s{:06}_a{:x}_{}x{}_{}_tm{}.bin",
+                                   DcTexDumpDir(), submit, info.guest_address,
+                                   info.size.width, info.size.height, clean_fmt,
+                                   static_cast<u32>(info.tile_mode));
+
+    const auto* src = reinterpret_cast<const u8*>(info.guest_address);
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        LOG_WARNING(Render_Vulkan, "[dc-texdump] fopen failed: {}", path);
+        return;
+    }
+    const size_t wrote = std::fwrite(src, 1, info.guest_size, f);
+    std::fclose(f);
+
+    LOG_INFO(Render_Vulkan,
+             "[dc-texdump] submit={} addr={:#x} size={}x{} pitch={} bits={} "
+             "fmt={} tile={} bytes={} -> {}",
+             submit, info.guest_address, info.size.width, info.size.height,
+             info.pitch, info.num_bits, fmt_str,
+             static_cast<u32>(info.tile_mode), wrote, path);
 }
 
 bool IsCompressedBC(vk::Format fmt) {
@@ -655,6 +1070,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     NoteDriveclubRaceGateCandidate(pipeline, regs);
     NoteDriveclubDrawlog(pipeline, regs);
     NoteDriveclubUboLog(pipeline, regs);
+    MaybeClampDriveclubLuminanceUbo(pipeline, regs);
+    MaybeRestoreDriveclubExposureUbo(pipeline, regs);
+    MaybeNukeDriveclubExposureUbo(pipeline, regs);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -706,6 +1124,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     NoteDriveclubRaceGateCandidate(pipeline, liverpool->regs);
     NoteDriveclubDrawlog(pipeline, liverpool->regs);
     NoteDriveclubUboLog(pipeline, liverpool->regs);
+    MaybeClampDriveclubLuminanceUbo(pipeline, liverpool->regs);
+    MaybeRestoreDriveclubExposureUbo(pipeline, liverpool->regs);
+    MaybeNukeDriveclubExposureUbo(pipeline, liverpool->regs);
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
@@ -1171,6 +1592,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image_id = image->depth_id;
                 image = &texture_cache.GetImage(image_id);
             }
+            MaybeDumpDriveclubTexture(*image);
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we
                 // need to force general layout on it.

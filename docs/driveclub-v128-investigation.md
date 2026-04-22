@@ -4023,3 +4023,487 @@ What remains plausible after these misses:
 - not the late image carriers they eventually feed
 
 - Static `CameraFade` / `SetCamera` string corruption is an adjacency path only: it changes race-start darkness and handoff, but still has not hit the blackout itself. Stop this line and pivot to runtime dispatch tracing instead of more string splits.
+
+## Phase 13 — the UBO dump breaks it open
+
+### Setup
+
+`SHADPS4_DC_UBOLOG=1` enabled a 128-byte hex dump of every non-special
+uniform buffer for six hand-picked race-window pipelines, guarded by
+the existing race-window arm. Single Munnar 19:30 baseline session
+captured 1905 frames / ~35 s. Log: `.../shadPS4/log/shad_log.txt`,
+32 MB, 150k `[dc-drawlog]` lines + 9k `[dc-ubolog]` lines.
+
+### The VideoOut-gamma red herring
+
+Every frame of the session, the game calls
+`sceVideoOutColorSettingsSetGamma(gamma=0.5)` and the follow-up
+`sceVideoOutAdjustColor` — 2181 back-to-back calls over 35 s, which
+then flow into `presenter.pp_settings.gamma`. The value never
+changes: no call ever uses anything but `0.5`. Since menus and
+panorama look fine while this is happening, the presenter gamma path
+is constant and cannot be the blackout on/off. `NoteDriveclubVideoOutGamma`
+only fires on values inside `[0.49..0.51]` so it stays in bounds but
+is decoupled from the actual dim.
+
+Side observation: `post_process.frag`'s `pow(rgb, 1.0/(2.4+1.0-pp.gamma))`
+curve does do something non-trivial at `gamma=0.5` (exponent 1/2.9
+instead of 1/2.4) — but since it is constant across the whole session
+it is not what flips the scene from bright to dim. Keep it filed as a
+"possibly wrong sRGB interpretation" follow-up, not a blackout lead.
+
+### The UBO offset that moves
+
+Pipeline `0xf6e5670be11b0009` dumps a 48-byte UBO at `stage=0 cb0`
+and the identical buffer at `stage=2 cb0` (same guest address — VS
+and FS both read it). Across 307 samples inside the race window
+(submits 1452..1758) only one float in that UBO ever changes: **offset 3**.
+
+Layout is invariant:
+
+    [0]=1.0    [1]=1.0    [2]=0.3     [3]=LUM      <-- only one that moves
+    [4]=1.0    [5]=0.25   [6]=1.0     [7]=0.25
+    [8]=0.25   [9]=1.0    [10]=0.25   [11]=1.0
+
+`[0..3]` looks like a `vec4(scale_r, scale_g, scale_b, luminance)` and
+`[4..11]` are two `vec4` weight masks `(1,¼,1,¼)` and `(¼,1,¼,1)` —
+textbook eye-adaptation / auto-exposure signature.
+
+Offset 3 is monotonically rising over the captured ~2 s:
+
+    submit=1452   lum=5.35
+    submit=1502   lum=7.50
+    submit=1602   lum=10.30
+    submit=1702   lum=12.65
+    submit=1758   lum=13.81
+
+307 samples, every single one larger than the one before. No
+oscillation, no convergence — a clean climb with constant slope. The
+session ended inside the climb, never reaching equilibrium.
+
+### Why this matches the symptom exactly
+
+The user-reported blackout:
+
+- kicks in a second after the race loads (adaptation starts from a
+  neutral value, then climbs)
+- deepens over 5–30 s (value keeps climbing as the system hunts for
+  a scene brightness it never stabilises on)
+- sometimes never comes back (the loop has no upper clamp — if the
+  target is numerically unreachable, it just stays dim forever)
+
+The HUD/minimap overlay on top of the blackout is untouched because
+overlays are composited *after* the tonemapper — this UBO only
+reaches the scene rendering, not the 2D UI passes. That also matches.
+
+### What's probably wrong
+
+This looks like an eye-adaptation feedback loop whose denominator or
+upper clamp is off. The rising value is almost certainly the
+"current adapted luminance" the tonemap divides by — so as it climbs,
+the scene gets darker. The loop either:
+
+- reads its histogram from a stale/over-bright HDR source (texture
+  cache serving the wrong resident copy, or a page-fault miss
+  returning zeros that get interpreted as "fully saturated"), or
+- never runs the shrinking half of the adapt loop (missed compute
+  dispatch, or a scheduling race between the histogram pass and the
+  tonemap's UBO write)
+
+Either way the downstream symptom is the same: offset 3 climbs
+without bound, and the tonemap responds by dimming the scene.
+
+### Next step — quick validation via clamp
+
+Before chasing the root cause in the histogram/compute side, cheap
+test:
+
+- at UBO bind time for pipeline `0xf6e5670be11b0009`, recognise the
+  invariant layout `(1.0, 1.0, 0.3, x, 1.0, 0.25, ...)` and overwrite
+  offset 3 with a fixed value (2.0, say — low end of the observed
+  range, near the "bright" plateau).
+- env-gate it: `SHADPS4_DC_LUM_CLAMP=2.0`.
+- if the blackout disappears or dramatically shortens, the UBO is
+  confirmed as the sole dim driver and the real fix is upstream in
+  whichever pass writes this value.
+- if the blackout is unchanged, this UBO is a downstream reader of
+  something else and we need a different intervention.
+
+If the clamp works, the follow-up is to find the shader that writes
+this UBO (compute pass that computes adapted luminance) and fix *its*
+feedback rather than patching the consumer. That compute shader is
+probably one of the other 5 `kDriveclubLaterRaceGatePipelines` that
+Codex already singled out.
+
+### Action items
+
+- extend `vk_rasterizer.cpp` with an `SHADPS4_DC_LUM_CLAMP` env knob
+  that rewrites offset 3 of the matching UBO shape at bind time
+- keep the drawlog + ubolog instrumentation in place — it's now the
+  primary diagnostic for this class of bug
+- longer session recording (5+ minutes) is still useful: need to see
+  whether the value *ever* plateaus on its own or keeps climbing
+  forever, and whether a brief recovery phase corresponds to a value
+  dip
+
+## Phase 14 — the scene-pipeline UBOs are the wrong layer
+
+Phase 13 built `SHADPS4_DC_LUM_CLAMP` to force offset 3 of pipeline
+`0xf6e5670be11b0009` down to 2.0 during the race window. The probe
+fired 1093 times across the session, signature matched, the write
+was observed — and the blackout was unchanged. Phase 13's "runaway
+eye-adaptation" story did not survive first contact.
+
+### Round 2 — phase-transition UBO in cb4
+
+Went back to the raw data and ranked all six logged pipelines by
+per-offset dynamic range. Pipelines `0x6bde71906ac1af18` /
+`0x1cdd747ee89204c0` stage=1 cb=4 stood out: a 32-float UBO whose
+tail block (offsets 24..31) flipped from `(292.6, 288.3, 271.3,
+13.6, 0.31, 0.31, 0.30, 0.015)` pre-race to **all zero** at
+submit 1466 — the exact gate-re-arm that coincides with race start.
+Also at the transition:
+
+- off[0]:  0.4 → 1.0
+- off[12]: 0   → 1    (clean binary flag)
+- off[16]: 0.001 → 0.59
+- off[20..22]: sign/magnitude shift
+
+Restored offsets 24..31 to the pre-race values during the Z phase
+via `SHADPS4_DC_EXPO_RESTORE=1`. Blackout unchanged again.
+
+### Round 3 — the "nuke" diagnostic
+
+Built `SHADPS4_DC_UBO_NUKE=1` — writes a loud ±1e30 pattern into
+the UBO at Draw-time to verify that in-place writes to guest
+memory from that hook actually propagate to the shader. Full-UBO
+nuke: scene went fully white during race and stayed white.
+**Writes do propagate.** This eliminated the "buffer_cache cached
+the upload too early" theory.
+
+### Round 4 — binary-searching the whitening
+
+Then narrowed which offsets, when blown to ±1e30, cause the
+whiteout:
+
+- nuke 0..31  → white
+- nuke 24..31 → white only in menu animation, race stays at baseline blackout
+- nuke 0..23  → white during race
+- nuke 0..11  → baseline
+- nuke 12..23 → white
+- nuke 12..17 → white
+- nuke 12..14 → baseline
+- nuke 15..17 → (implied) white
+- nuke 16     → white
+
+So off[16] is one of the values the fragment shader consumes into
+its final color math. Tried the obvious follow-up: force off[16]
+to 0.001 (the pre-race value) during the race window. **Baseline
+blackout, no brightness change.**
+
+### What this proves, and what it doesn't
+
+The Round-3/4 whiteout is a tonemap-overflow side effect: any
+float in the fragment-shader path, when pushed to ±1e30, overflows
+the tonemap and the visible composite clamps to white. That's
+orthogonal to the actual race-start dim mechanism. Setting the same
+offset to its *normal range* (0.001..6) did not shift brightness
+at all — so off[16] is not a scene-brightness multiplier.
+
+The cleanest reading is that the UBO in `0x6bde71906ac1af18` cb=4
+encodes a state transition (camera-mode / scene-context / lighting
+preset flip) that happens to coincide with the blackout but is not
+the thing drawing the dim pixels. Restoring the pre-race state
+doesn't repaint the scene bright because that scene's dim is
+produced somewhere else — most likely in a fullscreen
+tonemap/post-fx pass that runs after the scene draws and before
+the HUD composite.
+
+That matches the user-observed layering exactly: the HUD is drawn
+on top of the blackout and stays intact, so whatever dims the
+scene dims the HDR→SDR output of the tonemap, not the scene shader
+output directly.
+
+### Pivot — broaden the UBO probe to post-fx pipelines
+
+`kDcUboLogPipelines` currently lists six scene-draw pipelines
+Codex picked during Phase 12. We need to extend it (or replace it)
+with the pipelines that target `0x500cdd0000` alone with no depth
+— those are the fullscreen composition / tonemap / present passes
+where the dim logically has to live.
+
+Plan for the next round:
+
+- launch a clean drawlog-only session (no UBO interference), play
+  through Munnar 19:30 to recover the pipeline landscape
+- from `[dc-drawlog]` lines, extract every pipeline whose `rts` is
+  exactly `0x500cdd0000` with `depth=no` (or similar single-RT
+  fullscreen patterns) — those are tonemap candidates
+- add the top ~6 of those to `kDcUboLogPipelines` and capture
+  their UBOs across the race window
+- diff bright-phase vs dim-phase samples the same way, looking
+  for a clean multiplier that moves monotonically with the fade
+
+If a clean candidate shows up there, re-run the clamp/restore test
+on that offset — this time with confidence it's in the actual dim
+pipeline, not a coincident state UBO.
+
+### Status
+
+Binary `build/shadps4` currently has three experimental knobs live:
+
+- `SHADPS4_DC_LUM_CLAMP=<float>` — clamps off[3] of `0xf6e5..0009`
+- `SHADPS4_DC_EXPO_RESTORE=1`    — restores off[24..31] of the cb4 UBO
+- `SHADPS4_DC_UBO_NUKE=1`        — writes `off[16] = 0.001f` on cb4
+
+None of them changes the blackout. They're kept in tree as the
+scaffolding for the next round — all three become no-ops when the
+env var is unset.
+
+### Round 5 — extending the UBO probe to composition pipelines
+
+Added the three pipelines that write to the visible composite
+`0x500cdd0000` as their sole color target (depth=yes) — `0x2bd7..ae2`,
+`0xadd2..da9`, `0xe6e4..d99` — into `kDcUboLogPipelines`. One clean
+race session with UBOLOG on, 2064–1974 samples per pipeline.
+
+Findings:
+
+- `0xe6e4..d99` stage=0 cb=1 encodes two resolution modes: **80×48**
+  pre-race and **364×276** from submit 1300 onwards. `off[4..9]`
+  form `(width, height, 1/w, 1/h, 0.5/w, 0.5/h)` — classic luma grid
+  metadata. 80×48 is codex's luma-per-tile grid from the torture
+  probe. The mode switch lines up exactly with the 3rd gate arm,
+  i.e. race start.
+- `0x2bd7..ae2` cb=0/1 `off[12..14]` collapse from large per-frame
+  values (mean 39 / −23 / 7) to 2–3 static values (mean −0.5 / −0.4
+  / −0.7) at the same submit-1300 boundary.
+- `0xadd2..da9` has no clean phase-split; every offset is
+  per-frame-variable.
+
+None of these UBO shifts is the dim driver: the user-reported
+blackout during this run was brief (≈26 s, ending in a recovery)
+and showed the same "dark car static image" visual we flagged in
+Phase 12. The "mode switch at race start" pattern just confirms the
+game re-parameterises a lot of post-fx passes at the boundary; it
+doesn't tell us which pass paints the dim pixels. Still circling
+the same layer.
+
+### The three open paths
+
+Not giving up on any of them — they stay in-tree as parallel leads:
+
+1. **Hunt the overlay draw (in-flight, Phase 15 scaffolding below).**
+   The blackout visually reads as a specific *texture* — the "dark
+   car static image" — drawn as a fullscreen overlay over the scene,
+   not as a gradient. Dump every bound guest-side texture during
+   the race window, compare against UI assets in
+   `newui/panels/*.txt`, and find the draw that renders the overlay.
+   Once identified, either disable that draw, or force its alpha to
+   zero. Clearest win path if it works.
+
+2. **Probe the remaining single-RT `depth=no` post-fx pipelines.**
+   `0x5000900000`, `0x5000108000`, `0x500fdd0000`, `0x509a400000`,
+   `0x5015770000`, `0x501abf8000`, and friends all write 1920×1080
+   surfaces with depth disabled — classic fullscreen blit/post-fx
+   targets. Extend `kDcUboLogPipelines` to cover pipelines that hit
+   those RTs and repeat the bright-vs-dim diff. Slower, but it's
+   the same diagnostic that already found the cb4 mode flip — just
+   applied at the right layer this time.
+
+3. **Revisit codex's camera-fade line.** Phase 12 flagged
+   `CameraFade` / `SetCamera` adjacency as a partial hit: string
+   corruption "changes race-start darkness and handoff, but still
+   has not hit the blackout itself." That's not a dead end — it's
+   an underpowered lever. A targeted runtime hook that forces the
+   camera-fade output value to 1.0 at a known call site, rather
+   than patching strings, could finally either confirm or fully
+   rule out this axis.
+
+## Phase 15 — runtime texture dump
+
+`SHADPS4_DC_TEX_DUMP=1` turns on per-texture guest-memory dumping
+inside `Rasterizer::BindTextures`. One dump per unique
+`info.guest_address`, only while the race-window gate is armed.
+Output path:
+
+    $HOME/.local/share/shadPS4/texdump/s<submit>_a<addr>_<w>x<h>_<fmt>_tm<tile>.bin
+
+plus a `[dc-texdump]` log line with the same metadata so the log
+acts as a searchable index. Data is raw guest bytes — still tiled
+where the game stored them tiled — so de-swizzle happens offline
+with whatever follows shadPS4's `tile_manager` logic.
+
+The hit criteria: find a dump whose first-seen submit lands after
+a gate re-arm (= race start), whose dimensions are roughly 1920×1080
+or a power-of-two close to it, and whose pixel format matches a
+photo asset (8-bit RGBA / BC3 / BC7 rather than HDR float). That's
+the "dark car static image" candidate. Cross-check: does the same
+texture address appear during a bright recovery phase? If it only
+fires during dim, we've probably got the overlay.
+
+No mutation yet — this round is observation only.
+
+### Round 15a — first texdump session
+
+Clean Munnar 19:30 run with `SHADPS4_DC_DRAWLOG=1
+SHADPS4_DC_TEX_DUMP=1`. Gate arms at submits 383, 1094, 1309, 1453
+(race starts around submit 1309). Session ran 2967 submits / ~60 s.
+User-observed outcome this run: normal blackout (no "dark car
+static image" variant), scene recovered at ≈25 s.
+
+Output:
+
+    /mnt/data/distrobox/gaming/.local/share/shadPS4/texdump/
+        1079 .bin files, ~1.7 GB total
+
+All 1079 dumps indexed in the log as `[dc-texdump]` lines with
+metadata. The dumps are raw guest bytes — still in GCN tile order
+where the game stored the texture tiled. Tile modes seen: tm=0
+(DisplayLinearGeneral-ish depth buffers), tm=13 (Thin1DThin),
+tm=14 (Thin2DThin). Most asset textures are tm=13.
+
+### Round 15b — viewer pipeline
+
+Two converter scripts added to `tools/`:
+
+- `tools/texdump_to_dds.py` — wraps each dump in a DDS/DX10 header
+  so the file is nominally viewable by anything that reads DDS.
+  ImageMagick's `identify` recognises the shape but does not
+  decode BC7 (only DXT1/DXT5 via the legacy FourCC path).
+- `tools/texdump_to_png.py` — decodes BC1/BC3/BC4/BC5/BC7 and
+  passes through R8G8B8A8, emits a PNG per dump. Requires
+  `texture2ddecoder + Pillow`. A venv at `/tmp/texdec` is set up
+  for this on the current host.
+
+Output:
+
+    /mnt/data/distrobox/gaming/.local/share/shadPS4/texdump_png/
+        969 .png files
+
+The PNGs are spatially scrambled (the BC block order is the
+tiled-memory order, not row-major), so silhouettes are broken.
+Dominant colour patches survive, which is enough to triage a
+large batch but not to recognise fine detail. Full de-swizzle for
+GCN tm=13/tm=14 is a follow-up — shadPS4's own
+`video_core/amdgpu/tiling.cpp` plus `tile_manager.*` compute
+shader is the reference implementation to port to Python.
+
+### Round 15c — narrowing the visual hypothesis
+
+User feedback after eyeballing the PNGs: the blackout does **not**
+read as a full-screen photo. The visual signature is closer to a
+heavy camera vignette — darker towards the frame edges, with the
+centre slightly less dim — i.e. a *gradient / mask* compositing
+over the scene, not a full photo overlay. That rules out the
+fullscreen 1920×1080 BC7Srgb candidates I flagged first (those are
+likely lobby / menu backgrounds, kept around as resident assets).
+
+Candidates to check for gradient / vignette shape — prioritised by
+user:
+
+    s000383_a509b821a00_256x256_Bc1RgbaSrgbBlock_tm13.png
+    s000383_a5003831e00_128x128_Bc1RgbaSrgbBlock_tm13.png
+    s000490_a50b95d6c00_256x256_Bc1RgbaSrgbBlock_tm13.png
+    s001094_a5029e8f100_1024x1024_Bc1RgbaSrgbBlock_tm13.png
+    s001453_a50a4b42900_256x256_Bc1RgbaSrgbBlock_tm13.png
+
+Why these five, in the user's reading:
+
+- All are **Bc1 with sRGB + alpha** — the canonical format for UI /
+  overlay sprites that need a soft alpha (vignette masks ship this
+  way in most engines).
+- 256×256 and 128×128 are typical fullscreen-blend mask
+  resolutions; 1024×1024 is the higher-quality variant.
+- First-seen submits 383 / 490 / 1094 / 1453 straddle the gate
+  arms — one pre-race, one mid-load, one at race start — so if
+  the blackout mask is resident throughout it should appear here.
+- `0x50a4b42900` at submit 1453 is particularly interesting — it
+  first binds at the *second* gate arm of the race window, which
+  is the same boundary where the Phase 14 UBO state flips. Could
+  be the per-race vignette instance.
+
+These are all tiled and will look scrambled under the current
+`texdump_to_png.py`; a gradient is actually the *easiest* pattern
+to recognise under a tile-scramble because the per-tile means are
+preserved. So the PNGs should already be usable for triage —
+look for concentric light-to-dark patches.
+
+### Handoff notes
+
+State in-tree at time of handoff (branch `gamma-debug`):
+
+- `src/video_core/renderer_vulkan/vk_rasterizer.cpp` carries, in
+  order of addition:
+  - `NoteDriveclubDrawlog`                     — `SHADPS4_DC_DRAWLOG=1`
+  - `NoteDriveclubUboLog` + `kDcUboLogPipelines` — `SHADPS4_DC_UBOLOG=1`
+  - `MaybeClampDriveclubLuminanceUbo`          — `SHADPS4_DC_LUM_CLAMP=<float>`
+  - `MaybeRestoreDriveclubExposureUbo`         — `SHADPS4_DC_EXPO_RESTORE=1`
+  - `MaybeNukeDriveclubExposureUbo`            — `SHADPS4_DC_UBO_NUKE=1` (currently writes `floats[16]=0.001f`)
+  - `MaybeDumpDriveclubTexture`                — `SHADPS4_DC_TEX_DUMP=1`
+  - Pre-existing torture path                  — `SHADPS4_DC_TORTURE=1`
+- `scripts/run_driveclub_overlay.sh` passes all of these through
+  from environment.
+- `kDcUboLogPipelines` was extended in Phase 14 Round 5 to cover
+  the three single-RT composition pipelines. Safe to keep; they
+  are gated by the race-window guard so they cost nothing outside
+  the race window.
+- `tools/texdump_to_dds.py` and `tools/texdump_to_png.py` are
+  standalone — no emulator coupling, safe to leave on tree.
+
+Nothing in this list **fixes** the blackout. The emulator behaves
+exactly as baseline when none of the env knobs are set. Upstream
+has no dependency on any of these — if the fix ends up living in
+a completely different file, all of the above can be reverted in
+a single commit.
+
+Current quota status is running low, so the next working session
+will be in Codex. Concrete next steps for that session:
+
+1. **Triage the five user-picked Bc1 candidates above.** Open
+   their PNGs in a viewer, look for concentric brightness
+   gradients. A bigger batch contact-sheet for all `Bc1Rgba*`
+   textures under 1024×1024 is also useful —
+   ```
+   magick montage \
+     $(ls /mnt/data/distrobox/gaming/.local/share/shadPS4/texdump_png/*_Bc1RgbaSrgbBlock_*.png \
+        | head -60) \
+     -geometry 256x256+3+3 -tile 6x /tmp/bc1_batch.png
+   ```
+   If one of them looks like a centre-bright/edge-dark vignette,
+   that's almost certainly the mask.
+
+2. **If a mask candidate emerges**, map its guest address back to
+   the pipeline that binds it. The log already has a
+   `[dc-texdump] ... addr=0x...` line per dump; cross-reference
+   that address in the `[dc-drawlog]` entries of the same submit
+   to find which pipeline was drawing when that texture bound.
+   Then add that pipeline to `kDcUboLogPipelines` to get its UBOs
+   and see if an alpha-scale field is there.
+
+3. **If triage fails**, implement GCN detile in
+   `tools/texdump_to_png.py` — port the 2D tile math from
+   `src/video_core/amdgpu/tiling.cpp`. A detiled dump will make
+   silhouettes legible and should resolve the triage one way or
+   the other. That's the one meaningful piece of dev work left
+   on this branch if the quick triage does not converge.
+
+4. **Parallel lead: compute-shader output.** All UBO probing so
+   far has targeted graphics draws. shadPS4's auto-exposure /
+   bloom / luma-integration passes are compute dispatches which
+   the drawlog doesn't see. A `SHADPS4_DC_DISPATCHLOG=1` analogue
+   hooked into `Rasterizer::Dispatch` would surface any compute
+   pass that uses the luma/histogram textures from the torture
+   probe (`kTortureSourceAddrs`) as a binding, and let us do the
+   same per-submit UBO diff there. This is the cleanest way to
+   test whether the dim originates in a compute pass that writes
+   an exposure value into a buffer that graphics pipelines then
+   consume.
+
+5. **Do not retire any of the three open paths from Phase 14
+   above.** Overlay hunt is path 1 and is what we're actively in.
+   If overlay hunt fails, path 2 (remaining `depth=no` single-RT
+   post-fx UBOs) is the next diagnostic; path 3 (runtime
+   camera-fade hook) is the fallback when the diagnostic has gone
+   cold on both other paths.
+

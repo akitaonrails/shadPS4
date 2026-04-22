@@ -37,7 +37,9 @@ rm -f "$PIDFILE"
 #   SHADPS4_DC_DRAWLOG=1 scripts/run_driveclub_overlay.sh
 #   SHADPS4_DC_TORTURE=1 scripts/run_driveclub_overlay.sh
 PROBE_ENV=""
-for var in SHADPS4_DC_DRAWLOG SHADPS4_DC_TORTURE; do
+for var in SHADPS4_DC_DRAWLOG SHADPS4_DC_UBOLOG SHADPS4_DC_TORTURE \
+           SHADPS4_DC_LUM_CLAMP SHADPS4_DC_EXPO_RESTORE SHADPS4_DC_UBO_NUKE \
+           SHADPS4_DC_TEX_DUMP; do
   if [[ -n "${!var:-}" ]]; then
     PROBE_ENV+="${var}=${!var} "
   fi
