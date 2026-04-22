@@ -1879,6 +1879,370 @@ ls -lh /mnt/data/Projects/shadPS4/tmp/driveclub_overlay/CUSA00003/data/leveldata
    (Alternative: `rizin` / `rz-ghidra` for a lighter CLI path. Either
    works. Ghidra GUI is faster to navigate xrefs.)
 
+## Phase 10 — 2026-04-22 rethink: what the last day actually proved
+
+This section exists to prevent another loop through adjacent
+`CameraFade` / UI / late-render branches.
+
+### Clean misses and what they mean
+
+1. **Late rendered/image tree is not the blackout master switch.**
+   The full chain around:
+   - late black carrier `0x1c2223026ec47d56`
+   - `0x5000108000`, `0x5000900000`
+   - `0x5008130000`, `0x5009688000`, `0x50105c8000`
+   - the parallel `0x500fdd / 0x5015ae / 0x501e8f` branch
+   - the tiny `32x32` side input branch
+   
+   was stressed heavily. We changed:
+   - what image appears under blackout
+   - overall darkness
+   - whether the main view was black while HUD survived
+   
+   But **mirror blackout/recovery still behaved normally**. Therefore
+   this tree is a carrier/composite path for the main view, not the
+   shared blackout timer/gate.
+
+2. **Track-local and local prerace packs are adjacent only.**
+   `india_road_point_02_n.rpk`, `india_landscape_gui.rpk`, local
+   prerace camera fades, local postfx scalars, local animlib edits:
+   all of these changed the latched image or the darkness underneath
+   blackout, but never removed the blackout itself.
+
+3. **`globaldata.rpk` is probably relevant, but direct patching is not
+   a usable path.**
+   Even narrow `globaldata` edits (fade-only, RTT/grading-only, shared
+   postfx actor edits, single named fade-ish edits) repeatedly caused
+   black boot / hang / crash before race load. So:
+   - `globaldata` is still a plausible shared layer
+   - but brute-force pack patching there is too unstable to teach us
+     anything clean
+
+4. **Prerace UI/page families are not the blackout carrier.**
+   Replacing or rerouting:
+   - `FreeplayGetInCar`
+   - `PreraceWaiting`
+   - `PreraceCountdown`
+   - `get_in_car_animation`
+   - `vehicle_select_background`
+   - `loading_freeplay`
+   - `loading_india.rpk`
+   - `vehicle_previews.rpk`
+   
+   either did nothing, broke handoff flow, or only changed decorative
+   layers. The actual blackout persisted.
+
+5. **Safe `newui` fade-control assets are a clean miss.**
+   We widened `newui/control/transitions.ctl` from a narrow alpha-track
+   flatten to the whole safe fade family:
+   - `FadeUp`, `FadeOut`
+   - `ZoomInAndFade`, `ZoomOutAndFade`
+   - `FaceOffFadeIn`, `FaceOffFadeOut`
+   - `OverdriveTextFadeIn`, `OverdriveTextFadeOut`
+   - `RG_ScrollReady*`, `RG_ScrollGo*`, `RG_FadeBG*`
+   - `LiveColumnFade`
+   - `ResultIn`, `ResultOut`
+   
+   and rerouted the live race-path panels:
+   - `loading_freeplay.txt`
+   - `x_freeplay.txt`
+   - `x_live_lobby_pre_race.txt`
+   
+   to a no-op `NoFade` transition. Result: **baseline blackout**.
+   Therefore the safe declarative `newui` fade layer is not the switch.
+
+6. **String-adjacent camera/fade event names are not the switch.**
+   Broad and narrow experiments around:
+   - `CameraFade`
+   - `SetCamera`
+   - `ScreenFadeOut`
+   - `StartGame`
+   - `AutoPilot`
+   - `GarageEnable`
+   
+   produced only:
+   - much darker starts
+   - broken race launch handoff
+   - missing UI strings
+   - boot breakage
+   
+   but never disabled the blackout. The important lesson is not just
+   that these names missed; it is that **name-based/static string
+   patching is too indirect**.
+
+7. **A real code-side `ScreenFadeOut` store was identified and was a
+   clean miss.**
+   The direct handler/store at the inner-ELF function around
+   `0x146640`, with the matched overlay raw-store at `0x14a847`, was
+   NOPed by signature. Result: **baseline blackout**. So the obvious
+   explicit `ScreenFadeOut` config/store is not the controlling branch.
+
+### What we were fundamentally assuming wrong
+
+For most of the day, the working model was still:
+
+- "There is a specific fade effect, fade asset, or fade-named handler."
+- "If we corrupt enough things called fade/camera/postfx, we should hit it."
+
+That model is now too weak.
+
+The evidence fits a different model better:
+
+- the blackout is probably **not a named fade effect at all**
+- it is more likely a **stateful shared visibility gate or scene
+  ownership transition**
+- the gate acts **before main view and mirror split**
+- the explicit fade/camera/UI layers we can see are only consumers or
+  decorations around that state
+
+That explains why:
+- HUD survives
+- mirror is the best blackout oracle
+- the main view can be made black/dark/broken without touching the real
+  blackout timing
+- every declarative fade family keeps missing
+
+### What is actually missing from the investigation
+
+We have traced:
+- assets by name
+- UI control files by name
+- strings in the binary by name
+- late render dependencies by image address
+
+What we have **not** traced is the thing that matters most:
+
+- the **actual runtime state transition** that decides whether gameplay
+  cameras are allowed to present the world yet
+
+Concretely, the missing classes of probe are:
+
+1. **Live dispatch/call tracing, not string matching.**
+   We need the real callsites/handlers executing during:
+   - car select confirm
+   - race load begin
+   - blackout start
+   - blackout end / mirror recovery
+   
+   Names like `CameraFade` and `ScreenFadeOut` were not enough.
+
+2. **Shared pre-split camera/view ownership state.**
+   Anything that governs:
+   - prerace camera active vs gameplay camera active
+   - visibility ownership / handoff / "ready" state
+   - gating of scene presentation to mirror and main view together
+
+3. **Dynamic dispatch targets or message IDs, not the static strings
+   that happen to sit nearby in `.rodata`.**
+   The day repeatedly showed that patching visible strings only hits
+   adjacent registration/config plumbing.
+
+### Best next direction from this floor
+
+No more blind asset shotguns and no more string-token corruption.
+
+The next step should be a **runtime trace** of the actual prerace →
+gameplay handoff dispatch:
+- capture the live functions/message IDs/callbacks that fire between
+  car select and blackout start
+- capture the matching ones that fire when blackout lifts / mirror
+  recovers
+- patch only those exact live dispatches once identified
+
+If we cannot trace at that level, then we are still guessing around the
+edges, no matter how broad the shotgun is.
+
+### New working hypothesis (2026-04-22)
+
+The blackout is probably **not a fade effect** in the ordinary sense.
+
+It is more likely a **shared state-machine gate** that controls when the
+gameplay world is allowed to present after the prerace flow hands off to
+the real race. The visible fade-like behavior is only how that gate
+manifests on screen.
+
+That model fits all the clean misses:
+- UI fades do nothing
+- explicit `ScreenFadeOut` handling does nothing
+- local track/postfx changes only alter the image under blackout
+- late render/composite trees only alter the carrier image
+- mirror remains the best oracle for the real gate
+
+The likely structure is:
+1. menu / vehicle-select controller state
+2. prerace panorama / confirmation state
+3. race-load state
+4. gameplay world loaded but presentation still gated
+5. shared gate opens
+6. main view and mirror both recover
+
+### Exact user-observed runtime sequence to trace
+
+This is the sequence that must be traced in code, not inferred from
+asset names:
+
+1. **Car select**
+2. **Paint selection**
+3. **Confirm**
+4. **Brief world panorama with "start event" confirmation**
+5. **Race loads**
+6. **Cars visible on starting grid**
+7. **Blackout fades in**
+8. **After a delay, blackout fades out**
+9. **Mirror comes back with the world**
+
+Important consequence:
+- the blackout occurs **after** the race world is already present
+- it is therefore not just "loading screen still visible"
+- and not just "wrong prerace image"
+
+### Canonical baseline timeline (2026-04-22, user verbatim)
+
+Exact step-by-step of what the **unpatched** game does at race start,
+as observed in repeatable repro at India tracks, 19:30 clear:
+
+1. Car selection menu.
+2. Paint selection.
+3. Brief world panorama animates and presents a "start event"
+   confirmation.
+4. User presses X.
+5. Race loads and prepares.
+6. **For ~1 second the track is fully visible** — cars on grid
+   waiting for the green light, mirror working, scene in colour.
+7. **Blackout fades in**, darkens the whole scene to almost black.
+   Cars are **still faintly visible underneath**, especially the red
+   tail lights moving. Mirror goes **pure black** (no structure).
+8. Wait 10–30 s (variable, sometimes never recovers).
+9. Blackout fades out, mirror re-populates with the world, scene
+   lifts back to colour.
+10. Gameplay is responsive.
+
+Three details in step 7 are load-bearing:
+- main view is **dim but not zero** — HDR content like tail lights
+  survives the darkening, so the main scene render pass is still
+  executing and writing real values
+- mirror is **actually zero** — not dim, not faint, no shape visible
+  at all
+- HUD and minimap are **always fully intact** at their normal
+  brightness and colour, painted on top of whatever the scene layer
+  is doing. They are not gated by the blackout at all.
+
+That is not "exposure is low" alone. A single low-exposure multiplier
+applied to both the main HDR target and the mirror target would leave
+**both** with faint structure, not one dim and one black. The mirror
+being cliff-edge black while the main view is dim-but-visible means
+**two different mechanisms are in play simultaneously**:
+
+- main view: a multiplicative darkening, either by exposure value or
+  by a near-opaque black composite that still lets bright HDR pixels
+  burn through
+- mirror: the mirror *render pass itself* is suppressed, or its
+  output is overwritten with zero, or its source camera is disabled
+
+And the HUD/minimap being unaffected in the same frames means a third
+fact: **the gate does not gate the UI/HUD composite path at all**.
+The final frame is clearly a composite of:
+
+- a 3D world layer that is currently darkened
+- a mirror reflection layer that is currently zeroed
+- a HUD/minimap layer that is currently full-normal
+
+All three happen in the same frame. Only the first two are gated.
+
+That three-way split — main dim, mirror zero, HUD fine — is the
+signature of a **shared state-machine gate** governing the 3D world
+presentation subsystem (codex's 2026-04-22 hypothesis), not of any
+single named fade effect and not of the emulator's final present.
+
+### Comparison of the two working models
+
+Codex's gate model and the earlier init-delay hypothesis can both be
+held against this timeline:
+
+| Model | Predicts step 6 (track visible) | Predicts step 7 (main dim + mirror black) | Predicts step 9 (shared recovery) | Verdict |
+|---|---|---|---|---|
+| **Codex state-machine gate** | World is renderable, not yet gate-allowed to be *fully* presented | Gate closes: suppresses mirror pass entirely, multiplicatively darkens main | Gate opens, both subsystems re-enable together | Fits cleanly |
+| **Init-delay / unconverged scene** | World not yet rendered; no track visible on frame 1 | N/A — would predict dim *before* cars appear, not *after* | N/A — init has no "close and re-open" motion | Rejected by step 6 |
+
+The init model is now out. The cars-visible-then-darken sequence is
+not what an init delay looks like. The gate model is what remains.
+
+Refinement on the gate model from this observation:
+
+- the gate is not a single visual effect; it's **one signal driving
+  at least two subsystems simultaneously** (main-view darken +
+  mirror suppress).
+- whatever the game code checks to decide "gate open" has to be the
+  same flag read by both the mirror pipeline and the main-view
+  tonemap / composite path.
+- that shared flag is the real target. Binary-patching it to always
+  read "open" is what would actually fix the blackout, independent
+  of any visual-layer patches.
+
+### Why 3 days of patches keep missing
+
+Everything we patched so far lived **past** the gate:
+
+- UI panels → consumer of the gate's presentation permission
+- PostFXConfig scalars → tuning of the already-permitted pipeline
+- LUT swaps → colour mapping inside the already-permitted pipeline
+- prerace camera Fade tracks → animation driven at the gate-closed end
+- TXAA / NonBloomed → decay shape of the overlay, not its source
+- ScreenFadeOut NOP, CameraFade string corruption → decorations
+
+None of these can reach a flag that is evaluated before the main
+render subsystems even decide to run. We were dialling parameters on
+systems the gate was actively holding shut.
+
+Every "we changed how something looks" success reinforces the gate
+model: whatever the gate gates, we're allowed to tune *after* it
+decides to open. Before it decides, we can change nothing visible,
+because the gate won't let us.
+
+### Concrete shape of the next probe
+
+Codex already has this in the later sections: runtime dispatch trace
+instead of more declarative shotguns. This observation sharpens what
+to look for:
+
+- **one shared flag-read** that fires both at step 7 (gate close) and
+  at step 8 (gate open), checked simultaneously by
+  - the mirror render pass (enabled / skipped)
+  - the main-view scene darkening (exposure driven low or full-screen
+    composite darkening applied)
+- the HUD/minimap path does not read that flag, which is how we'll
+  identify the right code region: any trace where the HUD-composite
+  path moves in lockstep with the darkening is reading the wrong flag
+- the shared site is almost certainly a class accessor like
+  `GameWorld::IsPresentationReady()` / `Scene::IsRenderableToUser()`
+  or a specific handshake flag on the race-state controller that
+  gates the 3D-world subsystem only
+- once identified, a one-byte patch forcing it to return true unlocks
+  both the main-view darkening and the mirror simultaneously while
+  leaving HUD unchanged — that triple signature is the verification
+  that we've patched the right thing
+
+Worth adding to the resume point: any runtime trace must capture
+mirror-pass enable/disable toggles and main-view exposure or final
+composite branch around steps 6 → 7 → 8 **with HUD as a null control
+channel**. If a candidate flag also changes HUD rendering, it's not
+the gate — the gate leaves HUD untouched.
+
+### What the next trace must answer
+
+The next runtime probe must identify:
+- the controller/page/state transition from step 4 to step 5
+- the state transition that activates blackout at step 7
+- the state transition that re-enables world presentation at step 8/9
+- whether main view and mirror re-enable off the same gate or sibling
+  gates
+
+The next step should therefore be a **sequence tracer**, not another
+fade shotgun:
+- log the live handoff dispatches/callbacks/messages around this exact
+  sequence
+- then patch the exact live branch once identified
+
 2. Load the carved ELF:
 
    ```
@@ -2572,3 +2936,595 @@ family:
    - `AutoTargetLuminance`
    - `AutoSpeed`
    - colour-remap / grading overrides
+
+## Post-asset-sweep conclusions
+
+The later Munnar / prerace experiments narrowed several branches to
+clean misses.
+
+### `FreeplayGetInCar` / `PreraceWaiting` / `PreraceCountdown` UI path
+
+The prerace UI pages and panel files are **not** the blackout carrier.
+
+What was tried:
+
+- `freeplay.ctl`
+  - `getincar.freeplay -> GenericTiled`
+  - `getincar.freeplay -> PreraceWaiting`
+- `prerace.ctl`
+  - `PreraceWaiting -> GenericTiled`
+  - `PreraceCountdown -> GenericTiled`
+- panel file swaps / visual probes
+  - `get_in_car_animation.txt` changed to a loud full-screen magenta
+    fill
+  - `x_preracewaiting.txt` changed to a loud full-screen magenta fill
+  - `x_preracecountdown.txt` changed to a loud full-screen cyan fill
+
+Observed behavior:
+
+- replacing or rerouting `getincar.freeplay` blocked forward progress
+  from car select
+- replacing the `FreeplayGetInCar` page asset caused a hang
+- the magenta `get_in_car_animation` probe only produced a thin line at
+  the bottom of the screen
+- the cyan `PreraceCountdown` probe briefly appeared as a thin line,
+  then vanished
+- the actual blackout still happened normally
+
+Conclusion:
+
+- these pages/controllers participate in the transition
+- they are **not** the blackout image or blackout switch
+- `FreeplayGetInCar` owns an important forward-handoff contract, but
+  not the blackout itself
+
+### `india_landscape_gui.rpk`
+
+`india_landscape_gui.rpk` was the last strong local rendered-preview
+candidate on the asset side. It turned into a clean miss.
+
+Probe summary:
+
+- local cutscene camera:
+  - `EVO+LEVEL+ACTORCutsceneCamera_2386587591`
+- local GUI postfx:
+  - `EVO+LEVEL+ACTORPostFXConfig_exterior`
+  - `EVO+LEVEL+ACTORPostFXConfig_interior`
+- shared/global postfx actors embedded in the pack:
+  - `EVO+LEVEL+ACTORPostFX_bloom`
+  - `EVO+LEVEL+ACTORPostFX_BloomOverride`
+  - `EVO+LEVEL+ACTORPostFX_TXAAOverride`
+
+Patch set that was tested together:
+
+- cutscene camera `Fade = 0`
+- `PostFXConfig_*` neutralized
+- `PostFX_bloom` neutralized
+- `PostFX_BloomOverride` neutralized
+- `PostFX_TXAAOverride` neutralized
+
+Observed behavior:
+
+- Munnar still behaved like baseline
+- blackout timing and recovery were unchanged
+
+Conclusion:
+
+- `india_landscape_gui.rpk` is not the blackout switch
+- the rendered preview that persists under blackout is not owned by this
+  local GUI pack alone
+
+### Shared `globaldata` animationlib RTT/grading-only shot
+
+After broad and fade-only `globaldata.rpk` edits were already known to
+be unstable, a narrower animationlib-only shot was attempted:
+
+- `RTT_BLUR_ON`
+- `RTT_BLUR_OFF`
+- `RTT_GRADING_ON`
+- `RTT_GRADING_OFF`
+
+with:
+
+- `TemporalFade = 0`
+- `OverrideBlend = 0`
+
+and **without** touching:
+
+- `FadeIn`
+- `FadeOut`
+- `FadeIn_Fast`
+- `FadeOut_Fast`
+- shared actor records
+
+Observed behavior:
+
+- still black-booted / hung before reaching race start
+
+Conclusion:
+
+- even narrow `globaldata` animationlib edits are too unstable to use
+  as a practical runtime patch surface
+- `globaldata` remains analysis-only unless a much safer patch or
+  runtime override method exists
+
+### Shared prerace state-string rewrite
+
+A code-side state rewrite was attempted on overlay `eboot.bin`:
+
+- `kViewVehicle -> kStart`
+- `kGetInVehicle -> kStart`
+
+Observed behavior:
+
+- race still loaded normally
+- blackout still happened normally
+- the game then hung in-race and could not be exited cleanly
+
+Conclusion:
+
+- this did hit a shared state path
+- it did **not** hit the blackout switch
+- blind rewriting of prerace state literals is not a productive next
+  path
+
+### Current load-bearing conclusions
+
+What is now effectively exhausted:
+
+- host-present / gamma / final output theory
+- prerace UI page/panel family
+- local Munnar prerace/postfx brute-force as the blackout master switch
+- `india_landscape_gui.rpk`
+- direct `globaldata.rpk` mutation as a safe runtime test path
+- blind prerace state-string rewrites
+
+What still seems plausible:
+
+- a code-side handoff/state branch around the actual car select ->
+  race-load -> blackout transition
+- but it needs targeted tracing first, not another guessed family cut
+
+### Best next code-side trace points
+
+The most useful code-side sites found so far are:
+
+- `0x2936a0`
+  - shared freeplay/prerace string/state user
+- `0x2c1cc0`
+  - real `kGetInVehicle` user in the freeplay/prerace path
+- `0x2c5200`
+  - dispatcher that maps one branch directly to `kGetInVehicle`
+
+Recommended next step:
+
+- instrument these specific paths to log which state/page/camera branch
+  is actually selected at:
+  - car select confirm
+  - race load handoff
+  - blackout start
+- then patch the chosen branch once, instead of doing another broad
+  asset or controller shotgun
+
+## Dump-driven late-branch analysis
+
+After the asset/UI/controller branches stalled, the investigation moved
+to race-start image/pipeline dumping around the actual blackout window.
+
+### First concrete late carrier
+
+The first useful dump split showed:
+
+- `0x500cdd0000` contains a healthy race image before blackout fully
+  settles
+- a later graphics pipeline writes two full-res black outputs:
+  - `0x5000108000`
+  - `0x5000900000`
+- that pipeline hash is:
+  - `0x1c2223026ec47d56`
+
+Its observed sampled inputs included:
+
+- `0x5016040000` full-res `R8G8B8A8Snorm`
+- `0x5015a20000` `512x384`
+- `0x501e910000` / later `0x501e8f0000` `32x32`
+
+This was the first strong late-stage carrier candidate.
+
+### Late carrier is not the blackout switch
+
+Several direct torture shots were run against that late family.
+
+#### Skip late black-output pipeline
+
+Skipping `0x1c2223026ec47d56` caused:
+
+- main scene all black
+- HUD/map still intact
+- mirror still black at first, then recovering normally
+
+Conclusion:
+
+- `0x1c2223026ec47d56` is a main-view carrier/composite pass
+- it is **not** the blackout master switch
+
+#### Tiny `32x32` side branch
+
+The tiny compute producer:
+
+- `0x000001007af82364`
+
+writes:
+
+- `0x501e8f0000` / `0x501e910000`
+
+Observed input characteristics:
+
+- simple gradient-like `32x32` image input
+- one small state/control buffer
+
+Results:
+
+- skipping both compute producers feeding the late branch changed the
+  scene materially
+- skipping only the full-res `Snorm` compute did **not** change the
+  blackout meaningfully
+- skipping only the tiny compute made the scene go black with HUD
+  intact, but the blackout timing still survived
+- nulling the tiny compute buffer briefly exposed a full-screen grey
+  overlay under HUD, then the usual blackout still happened
+
+Conclusion:
+
+- the tiny branch modulates a late overlay/composite input
+- it still does **not** appear to be the blackout master switch
+
+### Newer upstream full-res feedback family
+
+The wider passive graph dump exposed a newer upstream loop around these
+full-res surfaces:
+
+- `0x50105c8000`
+- `0x5009688000`
+- `0x5008130000`
+- compute auxiliaries:
+  - `0x501459f800`
+  - `0x5014d88800`
+  - `0x5015571800`
+  - `0x5016830000`
+
+Key producers/readers in that family:
+
+- `0x7e5d7e5e5abfc092` -> writes `0x50105c8000`
+- `0x7271230fb8d57731` -> reads `0x50105c8000 + 0x5008130000`, writes
+  `0x5009688000`
+- `0x88a292ce37169b74` -> reads `0x5011b20000 + 0x5009688000`, writes
+  `0x5008130000`
+- `0x00000209c18a474f` -> writes:
+  - `0x501459f800`
+  - `0x5014d88800`
+  - `0x5015571800`
+- `0x00000404da9734f2` -> reads those and writes `0x5016830000`
+- `0x729626e3082b941f` -> reads `0x5016830000`, writes `0x5008130000`
+
+Torture result:
+
+- skipping this family changed the scene strongly
+- user impression was "lots of motion blur or similar"
+- blackout still remained
+
+Conclusion:
+
+- this is another feeder/carrier family
+- still not the blackout switch
+
+### Parallel `500fdd / 5015ae / 501e8f` branch
+
+Another branch feeding the same late carrier was identified:
+
+- `0x500fdd0000`
+- `0x5015ae0000`
+- `0x501e8f0000`
+
+Key producers:
+
+- `0x8d3903b3d86ec69e`
+- `0xd95182db58ebc733`
+- `0x6df834395a1984ff`
+- `0x2a5e157a75d687d2`
+- `0x000001b96128ff3e`
+- `0x4a8b302d5b6ce10b`
+- `0x000001007af82364`
+
+Torture result:
+
+- scene all black again
+- HUD/map intact
+- mirror still black first, then recovering
+
+Conclusion:
+
+- this parallel branch is also only a visible-scene feeder/carrier
+- blackout timing survives above it
+
+### Broad combined late-feeder shot
+
+A broader "all known late feeders into the black carrier" shot was
+attempted by combining:
+
+- the `500813 / 500968 / 50105c` side
+- the `500fdd / 5015ae / 501e8f` side
+- tiny `32x32` sidecars
+
+Observed behavior:
+
+- unstable / crash on race load
+
+Binary split result:
+
+- Half A (`500813 / 500968 / 50105c` side) remained crash-prone
+- Half B (`500fdd / 5015ae / 501e8f` side) produced all-black scene
+  with HUD intact, but blackout still survived
+
+Conclusion:
+
+- the whole mapped late rendered/image tree is now best classified as:
+  - visible-scene carrier/composite machinery
+  - **not** the blackout master switch
+
+This is a load-bearing conclusion. It explains why so many earlier
+renderer-side shots changed tint, motion-blur feel, or the frozen image
+under blackout without actually disabling blackout timing.
+
+### Shared-state shot on the late carrier family
+
+To verify that the switch was not hiding in local state on the same
+pipelines, two state-only shots were run on the known carrier family and
+its immediate feeders:
+
+1. zero small read-only buffers / `Flatbuf`
+2. zero only `push_data`
+
+Observed behavior:
+
+- buffer/state zeroing darkened the scene under blackout
+- zeroing only `push_data` returned to baseline-like behavior
+- blackout timing still survived in both cases
+
+Conclusion:
+
+- even the local state on the late carrier family is not the blackout
+  master switch
+- the real gate is still above or outside this rendered/image branch
+
+### New code-side lead: gameplay camera dispatcher
+
+Disassembly of the best remaining code-side handoff sites produced the
+first concrete non-renderer branch with semantic meaning.
+
+At `0x2c5200`, the code is a dispatcher that selects values for:
+
+- `gameplay_camera_view`
+
+Observed candidate values in the string table:
+
+- `fly`
+- `simple`
+- `inputorbit`
+- `fixedoffset`
+- `driverhead`
+- `vehicle_attached`
+- `vehicle_chase`
+- `orbit`
+- `iview_obtainer`
+
+This is much more specific than the earlier page/controller guesses.
+It directly matches the repeated symptom that the blackout often carries
+a prerace/static camera-like image underneath it.
+
+Additional nearby code-side observations:
+
+- `0x2936a0` is still a shared freeplay/prerace state user
+- `0x2c1cc0` is still a real `kGetInVehicle`-path function
+- but `0x2c5200` now looks like the strongest concrete branch because it
+  selects actual gameplay camera view modes rather than only page/state
+  names
+
+### Updated load-bearing conclusion
+
+What is now effectively ruled out:
+
+- the late black-output pipeline as the blackout switch
+- the late `32x32` side branch as the blackout switch
+- the newer `500813 / 500968 / 50105c` feedback family as the blackout
+  switch
+- the parallel `500fdd / 5015ae / 501e8f` family as the blackout switch
+- local buffer / `Flatbuf` / `push_data` state on that late carrier
+  family
+
+What still looks promising:
+
+- a code-side race-handoff branch that selects or latches the wrong
+  gameplay camera / view mode
+- a shared state branch above the rendered late carrier tree
+
+Best next step after this doc update:
+
+- reset renderer-side torture to baseline
+- test a camera-mode branch on the `gameplay_camera_view` dispatcher
+  instead of another renderer-side family
+
+## Code-side camera-family follow-up
+
+The next code-side branch after the renderer/image tree was the shared
+camera / handoff family around:
+
+- `0x2c5200`
+- `0x2c1cc0`
+- `0x2936a0`
+- adjacent setup at `0x293840`
+
+### `0x2c5200` gameplay camera dispatcher
+
+Disassembly showed `0x2c5200` is not a page router. It is a dispatcher
+for:
+
+- `gameplay_camera_view`
+
+Observed string arms:
+
+- `fly`
+- `simple`
+- `inputorbit`
+- `fixedoffset`
+- `driverhead`
+- `vehicle_attached`
+- `vehicle_chase`
+- `orbit`
+- `iview_obtainer`
+- `world`
+- `photomode`
+- `blender`
+- `customisation`
+
+#### Broad camera-mode shot
+
+Test:
+
+- all dispatcher arms forced to `vehicle_chase`
+
+Observed behavior:
+
+- baseline behavior
+- blackout unchanged
+
+Conclusion:
+
+- blackout is not explained by a simple wrong `gameplay_camera_view`
+  choice in this dispatcher
+
+### `0x2c5200` shared camera-state apply block
+
+The handler does not only set `gameplay_camera_view`. It also applies a
+shared camera-state family:
+
+- `aperture_f_value`
+- `exposure_compensation`
+- `focal_distance_metres`
+- `shutter_speed`
+- `screen_filter_index`
+- `screen_filter_name`
+
+#### Narrow camera-parameter shot
+
+Test:
+
+- disable only the camera-parameter setter calls
+
+Observed behavior:
+
+- baseline behavior
+- blackout unchanged
+
+#### Broad camera-state shot
+
+Test:
+
+- disable the whole shared camera-state apply block, including
+  `gameplay_camera_view` and the parameter setters above
+
+Observed behavior:
+
+- baseline behavior
+- blackout unchanged
+
+Conclusion:
+
+- the full `0x2c5200` shared camera-state handler is a clean miss
+
+### `0x2c1cc0` `kGetInVehicle` helper family
+
+`0x2c1cc0` is a real `kGetInVehicle` path function. A later internal
+helper call inside it (`0x2c5710`) looked like the strongest remaining
+local handoff candidate.
+
+Test:
+
+- disable the `0x2c1cc0 -> 0x2c5710` helper call
+
+Observed behavior:
+
+- baseline behavior
+- blackout unchanged
+
+Conclusion:
+
+- this `kGetInVehicle` helper family is also a clean miss
+
+### `0x2936a0` broad shared transition/state function
+
+Earlier analysis had already flagged `0x2936a0` as a strong shared
+freeplay/prerace state user.
+
+Additional disassembly showed it mostly talks to strings such as:
+
+- `photomode`
+- `PhotoModeTutorial_JPSKU`
+- `PhotoModeTutorial`
+- `socialhub`
+- `text_description`
+
+Test:
+
+- function cut at entry (`ret`)
+
+Observed behavior:
+
+- baseline behavior
+- blackout unchanged
+
+Conclusion:
+
+- `0x2936a0` is not the blackout switch either
+- it is likely tutorial / shared UI-state logic, not the blackout gate
+
+### `0x293840` adjacent object-setup path
+
+Because `0x293840` seeds the shared `1b0` handoff object used by the
+other functions above, it was tested as the next broad cut in this
+family.
+
+Test:
+
+- function cut at entry (`ret`)
+
+Observed behavior:
+
+- boot crash / black boot
+
+Conclusion:
+
+- `0x293840` is too early / boot-sensitive to use as a practical
+  runtime torture target
+- it does not give usable blackout evidence
+
+### Updated family conclusion
+
+What is now effectively exhausted:
+
+- the `0x2c5200` camera-mode dispatcher
+- the `0x2c5200` shared camera-state apply family
+- the `0x2c1cc0` `kGetInVehicle` helper family
+- the broad `0x2936a0` shared transition/state function
+- the adjacent `0x293840` object-setup path as a safe torture target
+
+This means the whole current code-side camera/prerace caller family has
+gone cold in the same way the late rendered/image carrier tree did.
+
+What remains plausible after these misses:
+
+- the shared callee/object side those functions talk to
+- not the camera/prerace callers themselves
+- not the late image carriers they eventually feed
+
+- Static `CameraFade` / `SetCamera` string corruption is an adjacency path only: it changes race-start darkness and handoff, but still has not hit the blackout itself. Stop this line and pivot to runtime dispatch tracing instead of more string splits.
