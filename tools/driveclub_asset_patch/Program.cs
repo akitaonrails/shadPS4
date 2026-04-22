@@ -11,6 +11,10 @@ if (args.Length < 2)
 var inputPath = args[0];
 var outputPath = args[1];
 var mode = args.Length >= 3 ? args[2] : "default";
+var singleGlobalSequence = args.Length >= 4 ? args[3] : string.Empty;
+var singleGlobalField = args.Length >= 5 ? args[4] : string.Empty;
+var singleActorName = args.Length >= 6 ? args[5] : string.Empty;
+var singleActorField = args.Length >= 7 ? args[6] : string.Empty;
 
 if (!File.Exists(inputPath))
 {
@@ -18,7 +22,10 @@ if (!File.Exists(inputPath))
     return 2;
 }
 
-File.Copy(inputPath, outputPath, overwrite: true);
+if (!Path.GetFullPath(inputPath).Equals(Path.GetFullPath(outputPath), StringComparison.OrdinalIgnoreCase))
+{
+    File.Copy(inputPath, outputPath, overwrite: true);
+}
 
 using var pack = ResourcePack.Open(inputPath);
 var fileBytes = File.ReadAllBytes(outputPath);
@@ -39,7 +46,13 @@ foreach (var info in pack.ResourceInfos.Values)
 
     if (info.ResourceId.Type == ResourceTypeId.RTUID_ACTOR_DATA)
     {
-        if (mode != "global-fades-only" &&
+        if (!string.IsNullOrEmpty(singleActorName) && !string.IsNullOrEmpty(singleActorField) &&
+            name.Contains(singleActorName, StringComparison.OrdinalIgnoreCase))
+        {
+            PatchScalar(raw, singleActorField, 0.0f, patched, $"{name}.{singleActorField}");
+        }
+
+        if (mode != "global-fades-only" && mode != "global-rtt-only" &&
             name.Contains("PostFXConfig_", StringComparison.OrdinalIgnoreCase))
         {
             PatchScalar(raw, "TemporalFade", 0.0f, patched, $"{name}.TemporalFade");
@@ -58,20 +71,33 @@ foreach (var info in pack.ResourceInfos.Values)
             // remove the overlay source" patch.
         }
 
-        if (mode != "global-fades-only" &&
-            name.Contains("PostFX_BloomOverride_", StringComparison.OrdinalIgnoreCase))
+        if (mode != "global-fades-only" && mode != "global-rtt-only" &&
+            (name.Contains("PostFX_BloomOverride", StringComparison.OrdinalIgnoreCase) ||
+             name.Contains("PostFX_bloom", StringComparison.OrdinalIgnoreCase)))
         {
             PatchScalar(raw, "TemporalFade", 0.0f, patched, $"{name}.TemporalFade");
             PatchScalar(raw, "OverrideBlend", 0.0f, patched, $"{name}.OverrideBlend");
+            PatchScalar(raw, "MasterBrightness", 1.0f, patched, $"{name}.MasterBrightness");
+            PatchScalar(raw, "NonBloomedAttenuation", 0.0f, patched,
+                        $"{name}.NonBloomedAttenuation");
         }
 
-        if (mode != "global-fades-only" &&
+        if (mode != "global-fades-only" && mode != "global-rtt-only" &&
+            name.Contains("PostFX_TXAAOverride", StringComparison.OrdinalIgnoreCase))
+        {
+            PatchScalar(raw, "OverrideBlend", 0.0f, patched, $"{name}.OverrideBlend");
+            PatchScalar(raw, "TXAAOverallWeight", 0.0f, patched, $"{name}.TXAAOverallWeight");
+            PatchScalar(raw, "TXAAColourClamping", 0.0f, patched,
+                        $"{name}.TXAAColourClamping");
+        }
+
+        if (mode != "global-fades-only" && mode != "global-rtt-only" &&
             name.Contains("PostFX_ColourGradingOverride", StringComparison.OrdinalIgnoreCase))
         {
             PatchScalar(raw, "OverrideBlend", 0.0f, patched, $"{name}.OverrideBlend");
         }
 
-        if (mode != "global-fades-only" &&
+        if (mode != "global-fades-only" && mode != "global-rtt-only" &&
             (name.Contains("preracecam", StringComparison.OrdinalIgnoreCase) ||
              name.Contains("CutsceneCamera_", StringComparison.OrdinalIgnoreCase) ||
              name.Contains("WorldCamera_", StringComparison.OrdinalIgnoreCase) ||
@@ -100,13 +126,28 @@ foreach (var info in pack.ResourceInfos.Values)
             patched,
             $"{name}.exterior_remap");
 
-        // Iteration 2 bucket C (animationlib scalar-curve overrides) is
-        // currently DISABLED. The 2026-04-21 run using
-        // PatchNamedTrackKeyframes caused a null-ptr read in the game's
-        // .rpk parser at race-loading. The 0x2c/0x4c/0x6c offset assumption
-        // is only safe for the tracks we hand-verified; applying it blindly
-        // to animlib curves with different strides corrupts struct layout.
-        // Keep this block empty until a safer keyframe-row decoder exists.
+        // 2026-04-22: scripted-fade hunt. The video recorded this day
+        // proved the blackout is a scripted MasterBrightness curve dipping
+        // to ~0.0007 during prerace then jumping back to 1.0 at the cockpit
+        // handoff. The earlier blind-offset sweep crashed the parser; this
+        // version does VALUE-matched surgical writes: it finds the MasterBrightness
+        // track name in the animlib, scans up to 80 bytes after it, and replaces
+        // only the specific 4-byte float windows that currently read 0.003 or
+        // 0.0007. Any byte that parses as a different float is left alone —
+        // no structural integers, no timing fields, no slopes. Value-matched
+        // writes only.
+        //
+        // Expected effect: MasterBrightness animated curve stays at 1.0 for the
+        // entire prerace window. The blackout should either disappear entirely
+        // or (if there is a second animated scalar driving it) become visibly
+        // reduced so we can narrow further.
+        PatchAnimlibFloatValues(
+            raw,
+            "MasterBrightness",
+            new[] { (0.003f, 1.0f), (0.0007f, 1.0f) },
+            scanBytes: 96,
+            patched,
+            $"{name}.MasterBrightness.curve");
     }
 
     if (info.ResourceId.Type == ResourceTypeId.RTUID_ANIMATIONLIB &&
@@ -124,10 +165,37 @@ foreach (var info in pack.ResourceInfos.Values)
     if (info.ResourceId.Type == ResourceTypeId.RTUID_ANIMATIONLIB &&
         info.SourceAssetPaths.Any(p => p.Contains("globaldata.lvl", StringComparison.OrdinalIgnoreCase)))
     {
-        PatchNamedFadeSequence(raw, "FadeOut", patched, $"{name}.FadeOut");
-        PatchNamedFadeSequence(raw, "FadeIn", patched, $"{name}.FadeIn");
-        PatchNamedFadeSequence(raw, "FadeIn_Fast", patched, $"{name}.FadeIn_Fast");
-        PatchNamedFadeSequence(raw, "FadeOut_Fast", patched, $"{name}.FadeOut_Fast");
+        if (mode == "global-rtt-only")
+        {
+            PatchNamedScalarSequence(raw, "RTT_BLUR_ON", "TemporalFade", 0.0f, patched,
+                                     $"{name}.RTT_BLUR_ON.TemporalFade");
+            PatchNamedScalarSequence(raw, "RTT_BLUR_OFF", "TemporalFade", 0.0f, patched,
+                                     $"{name}.RTT_BLUR_OFF.TemporalFade");
+            PatchNamedScalarSequence(raw, "RTT_BLUR_ON", "OverrideBlend", 0.0f, patched,
+                                     $"{name}.RTT_BLUR_ON.OverrideBlend");
+            PatchNamedScalarSequence(raw, "RTT_BLUR_OFF", "OverrideBlend", 0.0f, patched,
+                                     $"{name}.RTT_BLUR_OFF.OverrideBlend");
+            PatchNamedScalarSequence(raw, "RTT_GRADING_ON", "OverrideBlend", 0.0f, patched,
+                                     $"{name}.RTT_GRADING_ON.OverrideBlend");
+            PatchNamedScalarSequence(raw, "RTT_GRADING_OFF", "OverrideBlend", 0.0f, patched,
+                                     $"{name}.RTT_GRADING_OFF.OverrideBlend");
+        }
+        else if (!string.IsNullOrEmpty(singleGlobalSequence) && !string.IsNullOrEmpty(singleGlobalField))
+        {
+            PatchNamedScalarSequence(raw, singleGlobalSequence, singleGlobalField, 0.0f, patched,
+                                     $"{name}.{singleGlobalSequence}.{singleGlobalField}");
+        }
+        else if (string.IsNullOrEmpty(singleGlobalSequence))
+        {
+            PatchNamedFadeSequence(raw, "FadeOut", patched, $"{name}.FadeOut");
+            PatchNamedFadeSequence(raw, "FadeIn", patched, $"{name}.FadeIn");
+            PatchNamedFadeSequence(raw, "FadeIn_Fast", patched, $"{name}.FadeIn_Fast");
+            PatchNamedFadeSequence(raw, "FadeOut_Fast", patched, $"{name}.FadeOut_Fast");
+        }
+        else
+        {
+            PatchNamedFadeSequence(raw, singleGlobalSequence, patched, $"{name}.{singleGlobalSequence}");
+        }
         if (mode != "global-fades-only")
         {
             PatchNamedScalarSequence(raw, "RTT_BLUR_ON", "TemporalFade", 0.0f, patched, $"{name}.RTT_BLUR_ON.TemporalFade");
@@ -166,6 +234,70 @@ static void PatchScalar(Span<byte> raw, string fieldName, float value, List<stri
 
     BinaryPrimitives.WriteSingleLittleEndian(raw[valueOffset..(valueOffset + 4)], value);
     patched.Add($"{label}={value}");
+}
+
+// Value-matched animlib keyframe patch.
+//
+// Looks up `trackName` as an ASCII substring. For every occurrence, scans
+// up to `scanBytes` bytes after the name; at every 4-byte-aligned or
+// unaligned window it reads as a little-endian float. For each entry in
+// `replacements`, finds the first window whose current value matches
+// `oldValue` within a tight tolerance and overwrites it with `newValue`.
+// Only one match is written per (oldValue, newValue) pair per name-
+// occurrence; every other byte stays untouched, which is how we avoid the
+// April-20 "blind sweep overwrites a keyframe stride" crash mode.
+//
+// Use this for animationlib keyframed-scalar curves where we have
+// identified specific float values that need to change but do not yet know
+// the exact record layout.
+static void PatchAnimlibFloatValues(
+    Span<byte> raw,
+    string trackName,
+    (float oldValue, float newValue)[] replacements,
+    int scanBytes,
+    List<string> patched,
+    string label)
+{
+    var nameBytes = Encoding.ASCII.GetBytes(trackName);
+    var searchStart = 0;
+    var occurrence = 0;
+
+    while (true)
+    {
+        var relOff = raw[searchStart..].IndexOf(nameBytes);
+        if (relOff < 0)
+        {
+            return;
+        }
+
+        var nameOff = searchStart + relOff;
+        occurrence++;
+
+        var windowStart = nameOff + nameBytes.Length;
+        var windowEnd = Math.Min(windowStart + scanBytes, raw.Length - 4);
+
+        foreach (var (oldValue, newValue) in replacements)
+        {
+            // Tight tolerance — 0.5% of the target magnitude, floored at 1e-7.
+            // This prevents us from accidentally matching a different nearby
+            // float (e.g. an interpolation slope that shares a similar order
+            // of magnitude but is not the value we intend to rewrite).
+            var tolerance = Math.Max(Math.Abs(oldValue) * 0.005f, 1e-7f);
+            for (var scan = windowStart; scan < windowEnd; scan++)
+            {
+                var current = BinaryPrimitives.ReadSingleLittleEndian(raw.Slice(scan, 4));
+                if (Math.Abs(current - oldValue) < tolerance)
+                {
+                    BinaryPrimitives.WriteSingleLittleEndian(raw.Slice(scan, 4), newValue);
+                    patched.Add(
+                        $"{label}[{occurrence}] {trackName}+{scan - nameOff}: {oldValue:G6} -> {newValue:G6}");
+                    break;
+                }
+            }
+        }
+
+        searchStart = nameOff + nameBytes.Length;
+    }
 }
 
 static void PatchAsciiString(
