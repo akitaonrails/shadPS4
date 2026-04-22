@@ -42,11 +42,11 @@ exec distrobox-enter gaming -- sh -lc '
   export SDL_JOYSTICK_HIDAPI_PS5=1
   export SDL_JOYSTICK_HIDAPI_XBOX=1
   export SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
-  # RenderDoc on Linux only attaches when the SDL backend is X11. We
-  # normally run Wayland on the host; pinning X11 here for the capture
-  # session does not affect joystick handling. The $SDL_VIDEODRIVER fallback
-  # preserves a caller override if anyone wants Wayland back.
-  export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
+  # SDL backend auto-picked: wayland first, x11 fallback. We tried
+  # hard-forcing x11 for RenderDoc; the distrobox has no XAUTHORITY and
+  # the emulator died silently. With rdocEnable off in the per-game
+  # config, F12 falls back to the game-only screenshot path which works
+  # under Wayland.
   echo $$ > "$pidfile"
   exec "$bin" "$eboot" "$@"
 ' sh "$PIDFILE" "$BIN" "$EBOOT" "$@"
