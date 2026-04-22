@@ -844,6 +844,24 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+    // [dc-timeline] heartbeat so we can correlate any other log entry to a
+    // concrete frame number and wall-clock offset. Every 15 presents
+    // (~0.25 s at 60 Hz) we emit one line. Cheap, off-by-default cost is
+    // 1 atomic add + 1 modulo per present; only the modulo hit logs.
+    {
+        static std::atomic<u64> dc_timeline_counter{0};
+        static const auto dc_timeline_start = std::chrono::steady_clock::now();
+        const u64 dc_timeline_frame = dc_timeline_counter.fetch_add(1);
+        if ((dc_timeline_frame % 15) == 0) {
+            const auto dc_timeline_now = std::chrono::steady_clock::now();
+            const auto dc_timeline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            dc_timeline_now - dc_timeline_start)
+                                            .count();
+            LOG_INFO(Render_Vulkan, "[dc-timeline] frame={} t={}ms", dc_timeline_frame,
+                     dc_timeline_ms);
+        }
+    }
+
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
