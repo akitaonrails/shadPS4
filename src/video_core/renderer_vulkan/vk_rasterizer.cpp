@@ -3166,8 +3166,38 @@ void Rasterizer::OnSubmit() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
+    // Phase 28 candidate #4 — silent-skip instrumentation.
+    // Log every compute dispatch that the heuristic detectors drop so
+    // we can cross-reference with the Driveclub frame-order trace.
+    // Enabled via SHADPS4_DC_LOG_SKIPS=1.
+    const bool is_copy = IsComputeImageCopy(pipeline);
+    const bool is_meta = is_copy ? false : IsComputeMetaClear(pipeline);
+    const bool is_clear = (is_copy || is_meta) ? false : IsComputeImageClear(pipeline);
+    if (is_copy || is_meta || is_clear) {
+        static const bool log_skips = [] {
+            const char* env = std::getenv("SHADPS4_DC_LOG_SKIPS");
+            const bool on = env && env[0] == '1' && env[1] == '\0';
+            if (on) LOG_INFO(Render_Vulkan,
+                             "[dc-skip-log] enabled (SHADPS4_DC_LOG_SKIPS=1)");
+            return on;
+        }();
+        if (log_skips && pipeline->IsCompute()) {
+            const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
+            const auto& cs_pgm = liverpool->GetCsRegs();
+            static std::mutex m;
+            static std::unordered_set<u64> seen;
+            std::lock_guard l{m};
+            if (seen.insert(cs.pgm_hash).second) {
+                const char* reason = is_copy  ? "IsComputeImageCopy"
+                                   : is_meta  ? "IsComputeMetaClear"
+                                              : "IsComputeImageClear";
+                LOG_INFO(Render_Vulkan,
+                         "[dc-skip-log] pgm_hash={:#018x} dim=({},{},{}) "
+                         "submit={} reason={}",
+                         cs.pgm_hash, cs_pgm.dim_x, cs_pgm.dim_y,
+                         cs_pgm.dim_z, g_driveclub_submit_index.load(), reason);
+            }
+        }
         return false;
     }
 
@@ -3607,6 +3637,29 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                                       vk::AccessFlagBits2::eShaderWrite,
                                   desc.view_info.range);
                 } else {
+                    // Phase 28 candidate #2 instrumentation: log any image
+                    // descriptor that goes READ_ONLY despite being
+                    // declared as written. Gated by SHADPS4_DC_LOG_RO_WRITES=1.
+                    static const bool log_ro_writes = [] {
+                        const char* env = std::getenv("SHADPS4_DC_LOG_RO_WRITES");
+                        return env && env[0] == '1' && env[1] == '\0';
+                    }();
+                    if (log_ro_writes) {
+                        static std::mutex rom;
+                        static std::unordered_set<u64> ro_seen;
+                        std::lock_guard l{rom};
+                        const u64 sig = std::hash<VAddr>{}(image.info.guest_address);
+                        if (ro_seen.insert(sig).second) {
+                            LOG_INFO(Render_Vulkan,
+                                     "[dc-ro-writes] image at guest={:#x} "
+                                     "size={}x{} format={} forced READ_ONLY "
+                                     "(desc.type non-storage, no force_general)",
+                                     image.info.guest_address,
+                                     image.info.size.width,
+                                     image.info.size.height,
+                                     static_cast<u32>(image.info.pixel_format));
+                        }
+                    }
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
