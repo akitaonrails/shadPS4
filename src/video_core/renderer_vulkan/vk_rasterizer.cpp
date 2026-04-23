@@ -72,6 +72,9 @@ std::atomic<u64> g_driveclub_current_pipeline_hash{};
 // arm the gate, so the true race-start is typically arm #3 or #4. The
 // texnuke probe reads this to optionally skip earlier arms.
 std::atomic<u32> g_driveclub_arm_count{};
+// Submit index at the most recent gate arm. Lets timing-based probes
+// count how many submits ago the race kicked off.
+std::atomic<u64> g_driveclub_last_arm_submit{};
 
 // Classification of the draw currently in flight based on its RT set.
 // Set by the Draw/DrawIndirect entry points so BindTextures-time hooks
@@ -229,6 +232,7 @@ void NoteDriveclubRaceGateCandidate(const GraphicsPipeline* pipeline, const AmdG
     if (state.num_hashes >= kDriveclubRaceGateMinHashes &&
         g_driveclub_race_window.exchange(kDriveclubRaceWindowSubmits) == 0) {
         const u32 n = g_driveclub_arm_count.fetch_add(1) + 1;
+        g_driveclub_last_arm_submit.store(submit_index);
         LOG_INFO(Render_Vulkan,
                  "[dc-gate] armed#{} submit={} hashes={} visible=true hdr=true depth=true",
                  n, submit_index, state.num_hashes);
@@ -1390,6 +1394,55 @@ float GetDcExposurePinValue() {
     return v;
 }
 
+
+// Dump the first 128 bytes of every SSBO bound to the tonemap compute
+// on every bind. Rate-limited to one dump set per ~30 submits so the
+// log stays manageable across a race. Enabled by
+// SHADPS4_DC_TONEMAP_SSBODUMP=1.
+void MaybeDumpDriveclubTonemapSsbo(VAddr base, u64 size, u32 cb_idx) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_TONEMAP_SSBODUMP");
+        const bool v = env && env[0] == '1' && env[1] == '\0';
+        if (v) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-tmdump] enabled (SHADPS4_DC_TONEMAP_SSBODUMP=1)");
+        }
+        return v;
+    }();
+    if (!enabled) return;
+    if (!IsDriveclubGuardEnabled()) return;
+    if (g_driveclub_race_window.load() == 0) return;
+    if (g_driveclub_current_pipeline_hash.load() != 0x000002c995517e7full) return;
+    if (g_driveclub_current_draw_kind.load() !=
+        static_cast<u8>(DriveclubDrawKind::Compute)) return;
+    if (base == 0 || size == 0) return;
+
+    // Per-submit+cb_idx dedup: one dump per (submit, cb_idx) tuple.
+    // Additionally throttle: only dump every 30 submits to keep log size
+    // reasonable over a long race.
+    const u64 submit = g_driveclub_submit_index.load();
+    static std::mutex dedup_mutex;
+    static u64 last_dump_submit = 0;
+    {
+        std::lock_guard lock{dedup_mutex};
+        if (cb_idx == 0) {
+            if (submit - last_dump_submit < 30) return;
+            last_dump_submit = submit;
+        }
+    }
+
+    const size_t len = std::min<size_t>(128, size);
+    std::string hex;
+    hex.reserve(len * 2);
+    const auto* bytes = reinterpret_cast<const u8*>(base);
+    for (size_t j = 0; j < len; ++j) {
+        fmt::format_to(std::back_inserter(hex), "{:02x}", bytes[j]);
+    }
+    LOG_INFO(Render_Vulkan,
+             "[dc-tmdump] submit={} cb{} addr={:#x} bytes={}",
+             submit, cb_idx, base, hex);
+}
+
 void MaybePinDriveclubExposure(VAddr base, u64 size, u32 cb_idx) {
     if (!IsDcExposurePinEnabled()) return;
     if (!IsDriveclubGuardEnabled()) return;
@@ -1403,30 +1456,33 @@ void MaybePinDriveclubExposure(VAddr base, u64 size, u32 cb_idx) {
     // → byte 64.
     constexpr size_t kExposureByteOffset = 16 * sizeof(u32);
     if (base == 0 || size < kExposureByteOffset + sizeof(float)) return;
-    const float threshold = GetDcExposurePinValue();
-    auto* target = reinterpret_cast<float*>(base + kExposureByteOffset);
-    const float previous = *target;
-    // CLAMP MIN, not hard pin. Bright tracks (Canada, Japan) already
-    // have natural values above the threshold and are left alone.
-    // Only the dim-biased tracks (Munnar 19:30, etc.) hit the floor
-    // and get boosted to the threshold value.
-    if (!(previous < threshold)) return;
-    *target = threshold;
-    // Log the first time per session (observability) plus log if the
-    // natural value has visibly changed from the last one we saw —
-    // that gives us a trace of the fade animation curve.
+    const float pin_value = GetDcExposurePinValue();
+    auto* target16 = reinterpret_cast<float*>(base + kExposureByteOffset);
+    const float previous = *target16;
+    // HARD PIN the known exposure scalar at dword offset 16.
+    *target16 = pin_value;
+
+    // Phase 24: cb4 has a second animated scalar at dword offset 8
+    // that swings *opposite* to offset 16 (dim state: 0.63, lift
+    // state: 0.26). Pin it to the lift-state value so the whole
+    // adaptation pair is killed, not just half of it.
+    constexpr size_t kOffset8Byte = 8 * sizeof(u32);
+    if (size >= kOffset8Byte + sizeof(float)) {
+        auto* target8 = reinterpret_cast<float*>(base + kOffset8Byte);
+        *target8 = 0.2624f;
+    }
+    // Log the first time per session + roughly every 60 submits
+    // thereafter so we can plot the exposure curve against race time.
     static std::mutex log_mutex;
-    static float last_seen_previous = 0.0f;
-    static bool first = true;
+    static u64 last_log_submit = 0;
     const u64 submit = g_driveclub_submit_index.load();
     {
         std::lock_guard lock{log_mutex};
-        if (first || std::fabs(previous - last_seen_previous) > 0.01f) {
+        if (last_log_submit == 0 || submit - last_log_submit >= 60) {
             LOG_INFO(Render_Vulkan,
-                     "[dc-exppin] submit={} addr={:#x} previous={} clamped_to={}",
-                     submit, base + kExposureByteOffset, previous, threshold);
-            last_seen_previous = previous;
-            first = false;
+                     "[dc-exppin] submit={} addr={:#x} previous={} pinned_to={}",
+                     submit, base + kExposureByteOffset, previous, pin_value);
+            last_log_submit = submit;
         }
     }
 }
@@ -1600,6 +1656,25 @@ const std::unordered_set<u64>& GetDcDispatchSkipPipes() {
 }
 
 bool ShouldSkipDriveclubDispatch(u64 pipeline_hash) {
+    // Auto-kill the histogram adaptation compute when exposure pin is
+    // on. Saves the user from having to remember to also pass a
+    // DISPATCH_SKIP list — both halves of the "kill auto-exposure"
+    // story travel together.
+    if (IsDcExposurePinEnabled() && IsDriveclubGuardEnabled() &&
+        g_driveclub_race_window.load() != 0) {
+        // 8 dim-only compute pipelines identified in Phase 19b; all go
+        // silent when adaptation converges naturally, so force them
+        // silent up front.
+        switch (pipeline_hash) {
+        case 0x0000089fc5730348ull: case 0x000008323ad915adull:
+        case 0x00000eea2b7d89d4ull: case 0x000002da4ae7f686ull:
+        case 0x000002f76d33c858ull: case 0x000006b667870fd4ull:
+        case 0x000000a556b3c66bull: case 0x00000f56cce1d724ull:
+            return true;
+        default:
+            break;
+        }
+    }
     const auto& skip = GetDcDispatchSkipPipes();
     if (skip.empty()) return false;
     if (!IsDriveclubGuardEnabled()) return false;
@@ -1647,6 +1722,114 @@ void NoteDriveclubDispatchlog(u64 pipeline_hash, u64 shader_pgm_hash,
     LOG_INFO(Render_Vulkan,
              "[dc-dispatchlog] submit={} pipeline={:#018x} shader={:#018x} dim=({},{},{})",
              submit_index, pipeline_hash, shader_pgm_hash, dim_x, dim_y, dim_z);
+}
+
+// Driveclub frame-order dump (Phase 24).
+//
+// SHADPS4_DC_FRAMEORDER=N — record the exact submit-order chain of
+// every Draw and every compute Dispatch for the first N gated
+// submits (race window armed AND NUKE_AFTER_ARM threshold satisfied).
+//
+// Where [dc-drawlog] and [dc-dispatchlog] dedup per (submit, pipeline)
+// tuple — which loses ordering and collapses repeated passes — this
+// mode preserves ordering so we can walk from the last scene-material
+// draw forward to the tonemap compute and enumerate every pass in
+// between. That chain is where the dim is produced (fog/atmosphere,
+// envmap/IBL update, pre-tonemap apply, etc.) per Phase 24 findings.
+u32 GetDcFrameOrderCount() {
+    static const u32 count = [] {
+        const char* env = std::getenv("SHADPS4_DC_FRAMEORDER");
+        if (!env || !env[0]) return 0u;
+        const u32 n = static_cast<u32>(std::strtoul(env, nullptr, 0));
+        if (n > 0) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-frameorder] enabled, will dump {} gated submit(s) "
+                     "(SHADPS4_DC_FRAMEORDER)",
+                     n);
+        }
+        return n;
+    }();
+    return count;
+}
+
+struct FrameOrderTicket {
+    bool enabled;
+    u64 submit_index;
+    u64 seq;
+};
+
+FrameOrderTicket BeginFrameOrderEvent() {
+    FrameOrderTicket t{false, 0, 0};
+    const u32 max_submits = GetDcFrameOrderCount();
+    if (max_submits == 0) return t;
+    if (!IsDriveclubGuardEnabled()) return t;
+    if (g_driveclub_race_window.load() == 0) return t;
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return t;
+    }
+
+    static std::mutex state_mutex;
+    static u64 recorded_submit = ~0ull;
+    static u32 submits_emitted = 0;
+    static u64 seq_in_submit = 0;
+    static bool finished = false;
+
+    const u64 submit_index = g_driveclub_submit_index.load();
+    std::lock_guard lock{state_mutex};
+    if (finished) return t;
+    if (submit_index != recorded_submit) {
+        if (submits_emitted >= max_submits) {
+            finished = true;
+            LOG_INFO(Render_Vulkan,
+                     "[dc-frameorder] finished after {} submit(s); disabling",
+                     submits_emitted);
+            return t;
+        }
+        recorded_submit = submit_index;
+        seq_in_submit = 0;
+        submits_emitted += 1;
+        LOG_INFO(Render_Vulkan,
+                 "[dc-frameorder] submit={} boundary (emitted {}/{})",
+                 submit_index, submits_emitted, max_submits);
+    }
+    t.enabled = true;
+    t.submit_index = submit_index;
+    t.seq = seq_in_submit++;
+    return t;
+}
+
+void NoteDriveclubFrameOrderDispatch(u64 pipeline_hash, u64 shader_pgm_hash,
+                                     u32 dim_x, u32 dim_y, u32 dim_z) {
+    const auto t = BeginFrameOrderEvent();
+    if (!t.enabled) return;
+    LOG_INFO(Render_Vulkan,
+             "[dc-frameorder] submit={} seq={:04} kind=disp "
+             "pipe={:#018x} shader={:#018x} dim=({},{},{})",
+             t.submit_index, t.seq, pipeline_hash, shader_pgm_hash,
+             dim_x, dim_y, dim_z);
+}
+
+void NoteDriveclubFrameOrderDraw(const GraphicsPipeline* pipeline,
+                                 const AmdGpu::Regs& regs) {
+    const auto t = BeginFrameOrderEvent();
+    if (!t.enabled) return;
+    const u64 pipeline_hash = std::hash<GraphicsPipelineKey>{}(pipeline->GetGraphicsKey());
+
+    std::string rts;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto& col_buf = regs.color_buffers[cb];
+        if (!col_buf) continue;
+        if (!rts.empty()) rts += ",";
+        rts += fmt::format("{:#x}", col_buf.Address());
+    }
+    if (rts.empty()) rts = "<none>";
+    const bool has_depth = regs.depth_buffer.DepthValid();
+    LOG_INFO(Render_Vulkan,
+             "[dc-frameorder] submit={} seq={:04} kind=draw "
+             "pipe={:#018x} rts={} depth={} idx={}",
+             t.submit_index, t.seq, pipeline_hash, rts,
+             has_depth ? "yes" : "no", regs.num_indices);
 }
 
 // Driveclub push-constant smasher (Phase 18).
@@ -2078,6 +2261,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
     NoteDriveclubRaceGateCandidate(pipeline, regs);
     NoteDriveclubDrawlog(pipeline, regs);
+    NoteDriveclubFrameOrderDraw(pipeline, regs);
     NoteDriveclubUboLog(pipeline, regs);
     MaybeClampDriveclubLuminanceUbo(pipeline, regs);
     MaybeRestoreDriveclubExposureUbo(pipeline, regs);
@@ -2140,6 +2324,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
     NoteDriveclubRaceGateCandidate(pipeline, liverpool->regs);
     NoteDriveclubDrawlog(pipeline, liverpool->regs);
+    NoteDriveclubFrameOrderDraw(pipeline, liverpool->regs);
     NoteDriveclubUboLog(pipeline, liverpool->regs);
     MaybeClampDriveclubLuminanceUbo(pipeline, liverpool->regs);
     MaybeRestoreDriveclubExposureUbo(pipeline, liverpool->regs);
@@ -2216,6 +2401,9 @@ void Rasterizer::DispatchDirect() {
     NoteDriveclubDispatchlog(cs_hash,
                              pipeline->GetStage(Shader::LogicalStage::Compute).pgm_hash,
                              cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    NoteDriveclubFrameOrderDispatch(
+        cs_hash, pipeline->GetStage(Shader::LogicalStage::Compute).pgm_hash,
+        cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     if (ShouldSkipDriveclubDispatch(cs_hash)) {
         return;
     }
@@ -2257,6 +2445,9 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     NoteDriveclubDispatchlog(cs_hash,
                              pipeline->GetStage(Shader::LogicalStage::Compute).pgm_hash,
                              cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    NoteDriveclubFrameOrderDispatch(
+        cs_hash, pipeline->GetStage(Shader::LogicalStage::Compute).pgm_hash,
+        cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     if (ShouldSkipDriveclubDispatch(cs_hash)) {
         return;
     }
@@ -2556,6 +2747,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(null_buffer.Handle(), 0, VK_WHOLE_SIZE);
             }
         } else {
+            MaybeDumpDriveclubTonemapSsbo(vsharp.base_address, size, i);
             MaybePinDriveclubExposure(vsharp.base_address, size, i);
             if (MaybeSmashDriveclubUbo(vsharp.base_address, size, i,
                                        desc.is_written, desc.is_formatted)) {

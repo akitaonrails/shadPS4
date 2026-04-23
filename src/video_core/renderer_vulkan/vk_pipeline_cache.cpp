@@ -292,6 +292,20 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        // Driveclub investigation: log every compile with the pipeline_hash ->
+        // stage shader hashes mapping so we can resolve pipeline hashes from
+        // the [dc-drawlog] trace to their SPIR-V dumps on disk.
+        std::string stage_hashes;
+        for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+            if (infos[stage]) {
+                if (!stage_hashes.empty()) stage_hashes += " ";
+                stage_hashes += fmt::format("{}=0x{:x}", static_cast<u32>(stage),
+                                            infos[stage]->pgm_hash);
+            }
+        }
+        LOG_INFO(Render_Vulkan, "[dc-pipemap] pipeline={:#018x} stages={}",
+                 pipeline_hash, stage_hashes);
+
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
