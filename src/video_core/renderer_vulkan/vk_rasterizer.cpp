@@ -1401,6 +1401,323 @@ float GetDcExposurePinValue() {
 }
 
 
+// SHADPS4_DC_RECORD=1 — consolidated recording harness for the
+// "find the missing ambient light" investigation. One env var turns
+// on the full capture set:
+//
+//   (a) Persistent session directory ~/Pictures/driveclub-runs/run-<wallclock>/
+//       so multiple runs don't overwrite each other.
+//   (b) Every ~120 submits, snapshot the three known lighting UBOs
+//       (1936 byte scene-light, 1008 byte sky-dome, 224 byte sun) to
+//       disk inside the session dir.
+//   (c) Every ~60 submits, log wall-clock-timestamped slot values for
+//       the known lighting offsets (1936: [24..31]; 1008: [84..90];
+//       224: [48..51]).
+//   (d) Every tonemap compute dispatch, log which images are bound and
+//       their gpu_modified flag (to check whether upstream produced
+//       HDR data at all).
+//
+// Correlate screenshot wall-clock against `[dc-record]` log lines to
+// establish exact value-domains for dim / pitch-black / calibrated.
+bool IsDcRecordEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_RECORD");
+        const bool on = env && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan, "[dc-record] enabled (SHADPS4_DC_RECORD=1)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+const std::string& DcRecordDir() {
+    static const std::string dir = [] {
+        const char* home = std::getenv("HOME");
+        const auto now = std::chrono::system_clock::to_time_t(
+            std::chrono::system_clock::now());
+        char stamp[32];
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&now));
+        std::string d = fmt::format("{}/Pictures/driveclub-runs/run-{}",
+                                     home ? home : "/tmp", stamp);
+        std::error_code ec;
+        std::filesystem::create_directories(d, ec);
+        LOG_INFO(Render_Vulkan, "[dc-record] session dir: {}", d);
+        return d;
+    }();
+    return dir;
+}
+
+// Helper — wall-clock timestamp formatted HH:MM:SS.mmm.
+std::string DcRecordTimestamp() {
+    const auto now = std::chrono::system_clock::now();
+    const auto tt = std::chrono::system_clock::to_time_t(now);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch()).count() % 1000;
+    char time_buf[16];
+    std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", std::localtime(&tt));
+    return fmt::format("{}.{:03d}", time_buf, static_cast<int>(ms));
+}
+
+// Per-submit periodic recorder: dumps 1936/1008/224 UBOs every N
+// submits to disk, and logs slot values every M submits.
+void MaybeRecordDriveclubLighting(VAddr base, u64 size, u32 cb_idx) {
+    if (!IsDcRecordEnabled()) return;
+    if (!IsDriveclubGuardEnabled()) return;
+    if (g_driveclub_race_window.load() == 0) return;
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return;
+    }
+    if (g_driveclub_current_draw_kind.load() !=
+        static_cast<u8>(DriveclubDrawKind::Scene)) return;
+    if (base == 0) return;
+
+    const u64 submit = g_driveclub_submit_index.load();
+    const auto* bytes = reinterpret_cast<const u8*>(base);
+    auto rf = [&](size_t slot) -> float {
+        return *reinterpret_cast<const float*>(bytes + slot * 4);
+    };
+
+    // Recognize each known UBO by (size, signature) and extract its
+    // key slot values. Throttle per submit.
+    static std::mutex m;
+    static u64 last_sample_submit_1936 = 0;
+    static u64 last_sample_submit_1008 = 0;
+    static u64 last_sample_submit_224 = 0;
+    static u64 last_snapshot_submit = 0;
+
+    const bool do_snapshot = (submit - last_snapshot_submit >= 120);
+
+    if (size == 1936) {
+        const float a24 = rf(24), a25 = rf(25), a26 = rf(26), a27 = rf(27);
+        if (!(a24 >= 0.f && a24 < 10000.f)) return;  // signature
+        // Log every 60 submits (once per tick)
+        bool do_log = false;
+        {
+            std::lock_guard l{m};
+            if (submit - last_sample_submit_1936 >= 60) {
+                last_sample_submit_1936 = submit;
+                do_log = true;
+            }
+        }
+        if (do_log) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-record-1936] wc={} submit={} ambient[24..27]="
+                     "{:.3g}/{:.3g}/{:.3g}/{:.3g} fade[38]={:.3g} "
+                     "fade[48]={:.3g} fade[50]={:.3g}",
+                     DcRecordTimestamp(), submit, a24, a25, a26, a27,
+                     rf(38), rf(48), rf(50));
+        }
+        if (do_snapshot) {
+            std::lock_guard l{m};
+            if (submit - last_snapshot_submit >= 120) {
+                last_snapshot_submit = submit;
+                const std::string path = fmt::format(
+                    "{}/snap_{}_sub{:06}_1936.bin", DcRecordDir(),
+                    DcRecordTimestamp(), submit);
+                std::FILE* f = std::fopen(path.c_str(), "wb");
+                if (f) {
+                    std::fwrite(bytes, 1, size, f);
+                    std::fclose(f);
+                }
+            }
+        }
+    } else if (size == 1008) {
+        const float v84 = rf(84), v85 = rf(85), v86 = rf(86);
+        if (!(v84 >= 0.f && v84 < 10000.f)) return;
+        bool do_log = false;
+        {
+            std::lock_guard l{m};
+            if (submit - last_sample_submit_1008 >= 60) {
+                last_sample_submit_1008 = submit;
+                do_log = true;
+            }
+        }
+        if (do_log) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-record-1008] wc={} submit={} sky[84..90]="
+                     "{:.3g}/{:.3g}/{:.3g}/_/{:.3g}/{:.3g}/{:.3g}",
+                     DcRecordTimestamp(), submit, v84, v85, v86,
+                     rf(88), rf(89), rf(90));
+        }
+        if (do_snapshot) {
+            const std::string path = fmt::format(
+                "{}/snap_{}_sub{:06}_1008.bin", DcRecordDir(),
+                DcRecordTimestamp(), submit);
+            std::FILE* f = std::fopen(path.c_str(), "wb");
+            if (f) {
+                std::fwrite(bytes, 1, size, f);
+                std::fclose(f);
+            }
+        }
+    } else if (size == 224) {
+        const float f0 = rf(0), f4 = rf(4);
+        if (!(f0 > 4.5f && f0 < 7.0f)) return;  // sun UBO signature
+        if (!(f4 > 2.5f && f4 < 3.5f)) return;
+        bool do_log = false;
+        {
+            std::lock_guard l{m};
+            if (submit - last_sample_submit_224 >= 60) {
+                last_sample_submit_224 = submit;
+                do_log = true;
+            }
+        }
+        if (do_log) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-record-224] wc={} submit={} sun_fade[48..51]="
+                     "{:.3g}/{:.3g}/{:.3g}/{:.3g}",
+                     DcRecordTimestamp(), submit, rf(48), rf(49), rf(50),
+                     rf(51));
+        }
+        if (do_snapshot) {
+            const std::string path = fmt::format(
+                "{}/snap_{}_sub{:06}_224.bin", DcRecordDir(),
+                DcRecordTimestamp(), submit);
+            std::FILE* f = std::fopen(path.c_str(), "wb");
+            if (f) {
+                std::fwrite(bytes, 1, size, f);
+                std::fclose(f);
+            }
+        }
+    }
+}
+
+// Phase 29 — "calibrate at arm" pin.
+//
+// The 1936-byte scene-lighting UBO has ~30 one-shot slots in
+// [144..295] that stay denormal/uninitialised for the first ~90s of
+// a Canada race and produce the visibly-dim-then-pitch-black arc.
+// The recalibration moment is the game finally writing real values
+// into those slots. We captured the recalibrated state as a byte-
+// perfect snapshot in tools/driveclub_pin_snapshots/.
+//
+// SHADPS4_DC_CALIBRATE_AT_ARM=1 + SHADPS4_DC_CALIBRATE_FILE=<path>
+// loads the snapshot and, on the very first race-arm-qualified
+// BindBuffers call for a 1936-byte scene UBO, memcpys the snapshot
+// over the game's (partially-initialised) bytes. After that single
+// write, the game takes over naturally — continuously-animated slots
+// update every frame; the one-shot slots were populated by our memcpy
+// so the scene renders correctly from the start.
+//
+// Fires once per race-arm bump. Re-entering a race bumps arm_count,
+// resets the "did I fire yet" latch, and re-applies.
+const std::array<u8, 1936>* GetDcCalibrateSnapshot() {
+    static const std::array<u8, 1936>* snap = [] () -> const std::array<u8, 1936>* {
+        const char* env = std::getenv("SHADPS4_DC_CALIBRATE_FILE");
+        if (!env || !env[0]) return nullptr;
+        static std::array<u8, 1936> buf{};
+        std::FILE* fp = std::fopen(env, "rb");
+        if (!fp) {
+            LOG_WARNING(Render_Vulkan,
+                        "[dc-calibrate] snapshot file {} missing", env);
+            return nullptr;
+        }
+        const size_t n = std::fread(buf.data(), 1, buf.size(), fp);
+        std::fclose(fp);
+        if (n != buf.size()) {
+            LOG_WARNING(Render_Vulkan,
+                        "[dc-calibrate] snapshot file {} short read {}/{}",
+                        env, n, buf.size());
+            return nullptr;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[dc-calibrate] snapshot loaded from {}", env);
+        return &buf;
+    }();
+    return snap;
+}
+
+bool IsDcCalibrateAtArmEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_CALIBRATE_AT_ARM");
+        const bool on = env && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-calibrate] enabled (SHADPS4_DC_CALIBRATE_AT_ARM=1)");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+bool MaybeCalibrateAtArmDriveclub(VAddr base, u64 size, u32 cb_idx) {
+    if (!IsDcCalibrateAtArmEnabled()) return false;
+    if (!IsDriveclubGuardEnabled()) return false;
+    // Note: no race_window check — that counter decrements to 0 between
+    // race-gate pipeline fires, which would block the pin for most of
+    // the race. Once armed above threshold, pin fires continuously.
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return false;
+    }
+    if (size != 1936) return false;
+    if (g_driveclub_current_draw_kind.load() !=
+        static_cast<u8>(DriveclubDrawKind::Scene)) return false;
+    if (base == 0) return false;
+    (void)cb_idx;
+
+    const auto* snap = GetDcCalibrateSnapshot();
+    if (!snap) return false;
+
+    auto* b = reinterpret_cast<u8*>(base);
+
+    // Signature: ambient slots at [24..26] must look like non-negative
+    // intensity magnitudes. Other 1936-byte buffers (flags, etc.)
+    // would fail this check.
+    auto rf = [&](size_t slot) -> float {
+        return *reinterpret_cast<const float*>(b + slot * 4);
+    };
+    const float a24 = rf(24), a25 = rf(25), a26 = rf(26);
+    if (!(std::isfinite(a24) && a24 >= 0.f && a24 < 10000.f)) return false;
+    if (!(std::isfinite(a25) && a25 >= 0.f && a25 < 10000.f)) return false;
+    if (!(std::isfinite(a26) && a26 >= 0.f && a26 < 10000.f)) return false;
+
+    // Selective pin — classified via timeline analysis across 49
+    // snapshots. These 11 slots stay at placeholder / near-zero /
+    // uninitialised values for the entire first ~90s of a Canada
+    // race, then jump to massively different values at the 1:30
+    // recalibration moment. They are the one-shot initialisation
+    // state the emulator fails to populate early. Pinning them to
+    // the calibrated snapshot's values gives the scene the
+    // initial state the game expects to have had from race-start,
+    // without touching the 247 continuously-animated slots that
+    // drive natural TOD evolution.
+    // 89 slots that differ structurally between the pitch-black and
+    // recalibrated snapshots, excluding the well-known continuously-
+    // animated slots (ambient [24..31], fade [38][48][50], sun
+    // directions, alpha factors). These are the actual "stuck at
+    // placeholder" slots that the game populates during the 1:30
+    // recalibration event and that scene shaders need from race-start
+    // on real PS4.
+    constexpr size_t kStuckJumpSlots[] = {
+        4, 84, 85, 100, 101, 104, 105, 112, 122, 123, 128, 129, 132,
+        138, 139, 144, 145, 146, 147, 148, 149, 150, 152, 153, 176,
+        178, 180, 181, 182, 186, 195, 196, 197, 200, 201, 202, 204,
+        205, 212, 213, 214, 215, 216, 224, 225, 226, 227, 231, 232,
+        233, 240, 241, 242, 243, 245, 246, 247, 248, 249, 250, 251,
+        252, 253, 256, 257, 260, 268, 270, 271, 273, 275, 276, 277,
+        278, 280, 281, 284, 285, 286, 287, 288, 289, 290, 291, 292,
+        293, 294, 295, 312,
+    };
+    const float* sfloats = reinterpret_cast<const float*>(snap->data());
+    float* tfloats = reinterpret_cast<float*>(b);
+    for (size_t slot : kStuckJumpSlots) {
+        tfloats[slot] = sfloats[slot];
+    }
+    static std::mutex log_m;
+    static u64 last_log_submit = 0;
+    const u64 submit = g_driveclub_submit_index.load();
+    std::lock_guard l{log_m};
+    if (submit - last_log_submit >= 120) {
+        last_log_submit = submit;
+        LOG_INFO(Render_Vulkan,
+                 "[dc-calibrate] applied at submit={} arm={} addr={:#x}",
+                 submit, g_driveclub_arm_count.load(), base);
+    }
+    return true;
+}
+
 // Dump the first 128 bytes of every SSBO bound to the tonemap compute
 // on every bind. Rate-limited to one dump set per ~30 submits so the
 // log stays manageable across a race. Enabled by
@@ -2611,6 +2928,82 @@ void MaybeSmashDriveclubPushConstants(Shader::PushData& push_data) {
     }
 }
 
+// Phase 28: probe what the tonemap compute reads. When the tonemap
+// compute (0x000002c995517e7f) has an image bound, log the guest
+// address, format, size, and the first 8 floats of its guest memory.
+// Gives a direct yes/no answer to "is HDR zero when tonemap reads it"
+// without any image dump / deswizzle step.
+//
+// Enabled via SHADPS4_DC_PROBE_TONEMAP=1.
+void MaybeProbeDriveclubTonemapInput(const VideoCore::Image& image) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_PROBE_TONEMAP");
+        const bool on = env && env[0] == '1' && env[1] == '\0';
+        if (on) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-tonemap-probe] enabled (SHADPS4_DC_PROBE_TONEMAP=1)");
+        }
+        return on;
+    }();
+    if (!enabled) return;
+    if (!IsDriveclubGuardEnabled()) return;
+    if (g_driveclub_race_window.load() == 0) return;
+    if (g_driveclub_current_pipeline_hash.load() != 0x000002c995517e7full) return;
+    if (g_driveclub_current_draw_kind.load() !=
+        static_cast<u8>(DriveclubDrawKind::Compute)) return;
+    const auto& info = image.info;
+    if (info.guest_address == 0) return;
+
+    // Throttle: one log per (submit, addr) pair, and overall once
+    // every 120 submits so we get a handful of samples across the race.
+    static std::mutex m;
+    static u64 last_submit_sampled = 0;
+    static std::unordered_set<u64> seen_this_burst;
+    const u64 submit = g_driveclub_submit_index.load();
+    bool emit = false;
+    {
+        std::lock_guard l{m};
+        if (submit - last_submit_sampled >= 120) {
+            last_submit_sampled = submit;
+            seen_this_burst.clear();
+        }
+        if (seen_this_burst.insert(info.guest_address).second) {
+            emit = true;
+        }
+    }
+    if (!emit) return;
+
+    // Log image state flags. guest_address bytes are stale (shadPS4
+    // doesn't sync render targets back to CPU unless explicitly asked),
+    // so the answer we need is in `image.flags`:
+    //   GpuModified = GPU wrote to this image  (upstream produced data)
+    //   Dirty       = CPU wrote to it since    (upstream is stale)
+    // If GpuModified=false for tonemap inputs, the upstream lighting
+    // compute never produced output — bug is upstream.
+    // If GpuModified=true, the data is in device-local Vulkan memory
+    // (unobservable from here) — downstream consumes correct data but
+    // produces wrong pixels.
+    const bool gpu_mod = True(image.flags & VideoCore::ImageFlagBits::GpuModified);
+    const bool dirty = True(image.flags & VideoCore::ImageFlagBits::Dirty);
+    const bool maybe_cpu = True(image.flags & VideoCore::ImageFlagBits::MaybeCpuDirty);
+    const auto* src = reinterpret_cast<const float*>(info.guest_address);
+    float f[4] = {};
+    std::memcpy(f, src, sizeof(f));
+    const auto now = std::chrono::system_clock::now();
+    const auto tt = std::chrono::system_clock::to_time_t(now);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        now.time_since_epoch()).count() % 1000;
+    char time_buf[32];
+    std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S",
+                  std::localtime(&tt));
+    LOG_INFO(Render_Vulkan,
+             "[dc-tonemap-probe] wc={}.{:03d} submit={} addr={:#x} "
+             "size={}x{} fmt={} gpu_mod={} dirty={} cpu_dirty={}",
+             time_buf, static_cast<int>(ms), submit, info.guest_address,
+             info.size.width, info.size.height,
+             vk::to_string(info.pixel_format), gpu_mod, dirty, maybe_cpu);
+}
+
 void MaybeDumpDriveclubTexture(const VideoCore::Image& image) {
     if (!IsDcTexDumpEnabled()) {
         return;
@@ -3459,6 +3852,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             MaybeDumpDriveclubTonemapSsbo(vsharp.base_address, size, i);
             MaybePinDriveclubExposure(vsharp.base_address, size, i);
             MaybeUboSnapshotDriveclub(vsharp.base_address, size, i);
+            MaybeRecordDriveclubLighting(vsharp.base_address, size, i);
+            if (MaybeCalibrateAtArmDriveclub(vsharp.base_address, size, i)) {
+                buffer_cache.InvalidateMemory(vsharp.base_address, size);
+            }
             if (MaybePinDriveclubLightFade(vsharp.base_address, size, i)) {
                 buffer_cache.InvalidateMemory(vsharp.base_address, size);
             }
@@ -3559,6 +3956,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 image = &texture_cache.GetImage(image_id);
             }
             MaybeDumpDriveclubTexture(*image);
+            MaybeProbeDriveclubTonemapInput(*image);
             if (MaybeNukeDriveclubTexture(*image)) {
                 // Page-fault tracking may not catch our own writes into
                 // tracked pages from this same thread, so explicitly
