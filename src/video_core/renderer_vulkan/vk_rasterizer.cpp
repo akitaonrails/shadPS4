@@ -3322,8 +3322,16 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
-    if (instance.IsMaintenance8Supported() ||
-        src_image.info.props.is_depth == dst_image.info.props.is_depth) {
+    // vkCmdCopyImage requires EXACT VkFormat match (or size-compatible
+    // formats under Maintenance8 — but even that doesn't permit e.g.
+    // D32_SFLOAT_S8_UINT → R8G8B8A8_SRGB because the byte sizes differ).
+    // The old heuristic `src.is_depth == dst.is_depth` let D32_SFLOAT
+    // and D32_SFLOAT_S8_UINT through; Vulkan correctly rejects the copy
+    // and the data silently never transfers (observed as Driveclub GI/
+    // lighting corruption). Be strict: only fast-path when pixel
+    // formats match exactly, otherwise always go through the buffer-
+    // mediated copy which accepts any format pair.
+    if (src_image.info.pixel_format == dst_image.info.pixel_format) {
         dst_image.CopyImage(src_image);
     } else {
         const auto& copy_buffer =
