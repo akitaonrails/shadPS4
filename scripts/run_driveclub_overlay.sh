@@ -58,7 +58,8 @@ for var in SHADPS4_DC_DRAWLOG SHADPS4_DC_UBOLOG SHADPS4_DC_TORTURE \
            SHADPS4_DC_LIGHT_PIN \
            SHADPS4_DC_LIGHT_PIN_FILE \
            SHADPS4_DC_LIGHT_PIN_FILE_224 \
-           SHADPS4_DC_LIGHT_PIN_WINDOW; do
+           SHADPS4_DC_LIGHT_PIN_WINDOW \
+           SHADPS4_DC_LIGHT_PIN_BOOST; do
   if [[ -n "${!var:-}" ]]; then
     PROBE_ENV+="${var}=${!var} "
   fi
