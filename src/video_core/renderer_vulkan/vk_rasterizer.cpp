@@ -5,6 +5,8 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1443,6 +1445,438 @@ void MaybeDumpDriveclubTonemapSsbo(VAddr base, u64 size, u32 cb_idx) {
              submit, cb_idx, base, hex);
 }
 
+// SHADPS4_DC_UBOSNAPSHOT=<period> — dump every scene-material UBO's
+// raw bytes to /tmp/dc-snapshots/ once every <period> submits after the
+// race window is armed.
+//
+// Mechanism: the first time we see a new submit index that meets the
+// "due for snapshot" threshold, mark that entire submit as active and
+// create a timestamped output directory for it. Inside the active
+// submit, every BindBuffers call for a scene pipeline dumps each
+// bound UBO (deduped per pipeline+cb). When the submit index advances,
+// the snapshot closes. Schedule the next due-submit = current + period.
+//
+// Goal: capture bright / dim / recovered states over a single race so
+// we can diff their UBO contents and pinpoint which bytes carry the
+// blackout fade curve.
+u32 GetDcUboSnapshotPeriod() {
+    static const u32 period = [] {
+        const char* env = std::getenv("SHADPS4_DC_UBOSNAPSHOT");
+        if (!env || !env[0]) return 0u;
+        const u32 n = static_cast<u32>(std::strtoul(env, nullptr, 0));
+        if (n > 0) {
+            LOG_INFO(Render_Vulkan,
+                     "[dc-ubosnap] enabled, period={} submits "
+                     "(SHADPS4_DC_UBOSNAPSHOT)", n);
+        }
+        return n;
+    }();
+    return period;
+}
+
+void MaybeUboSnapshotDriveclub(VAddr base, u64 size, u32 cb_idx) {
+    const u32 period = GetDcUboSnapshotPeriod();
+    if (period == 0) return;
+    if (!IsDriveclubGuardEnabled()) return;
+    if (g_driveclub_race_window.load() == 0) return;
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return;
+    }
+    // Only scene-material draws — skip compute (tonemap/histogram), UI,
+    // and post-fx. Scene covers the G-buffer fills which are the ones
+    // the game's lighting/fade state actually feeds.
+    if (g_driveclub_current_draw_kind.load() !=
+        static_cast<u8>(DriveclubDrawKind::Scene)) return;
+    if (base == 0 || size == 0) return;
+
+    const u64 submit = g_driveclub_submit_index.load();
+    const u64 pipe_hash = g_driveclub_current_pipeline_hash.load();
+
+    static std::mutex m;
+    static u64 next_due_submit = 0;
+    static u64 active_snap_submit = ~0ull;  // ~0 = no active snap
+    static u32 snap_id = 0;
+    static std::string snap_dir;
+    static std::unordered_set<u64> dedup;
+
+    bool dump_now = false;
+    std::string local_dir;
+    {
+        std::lock_guard lock{m};
+        // Advance snapshot window if this submit has left the active one.
+        if (submit != active_snap_submit) {
+            if (active_snap_submit != ~0ull) {
+                // Closing previous snapshot.
+                active_snap_submit = ~0ull;
+                dedup.clear();
+            }
+            // Is this submit the new trigger?
+            if (next_due_submit == 0) {
+                next_due_submit = submit;  // first valid submit triggers
+                                           // immediately.
+            }
+            if (submit >= next_due_submit) {
+                active_snap_submit = submit;
+                snap_id += 1;
+                next_due_submit = submit + period;
+                const auto tnow = std::chrono::system_clock::to_time_t(
+                    std::chrono::system_clock::now());
+                snap_dir = fmt::format(
+                    "/tmp/dc-snapshots/snap_{:04}_submit{}_{}", snap_id,
+                    submit, static_cast<long long>(tnow));
+                std::error_code ec;
+                std::filesystem::create_directories(snap_dir, ec);
+                LOG_INFO(Render_Vulkan,
+                         "[dc-ubosnap] opening snap #{} submit={} "
+                         "arm_count={} dir={}",
+                         snap_id, submit,
+                         g_driveclub_arm_count.load(), snap_dir);
+            }
+        }
+        if (submit == active_snap_submit) {
+            const u64 key = (pipe_hash ^ (static_cast<u64>(cb_idx) << 56));
+            if (dedup.insert(key).second) {
+                dump_now = true;
+                local_dir = snap_dir;
+            }
+        }
+    }
+    if (!dump_now) return;
+
+    const size_t len = static_cast<size_t>(size);
+    std::string fname = fmt::format(
+        "{}/pipe_{:016x}_cb{}_addr{:x}_sz{}.bin", local_dir, pipe_hash,
+        cb_idx, static_cast<u64>(base), len);
+    std::FILE* fp = std::fopen(fname.c_str(), "wb");
+    if (fp) {
+        std::fwrite(reinterpret_cast<const void*>(base), 1, len, fp);
+        std::fclose(fp);
+    } else {
+        LOG_WARNING(Render_Vulkan,
+                    "[dc-ubosnap] failed to open {} errno={}",
+                    fname, errno);
+    }
+}
+
+// SHADPS4_DC_LIGHT_PIN=1 — Phase 26 finding: a 1936-byte cb1 ring-
+// buffer bound by two specific scene-material pipelines carries four
+// co-modulated floats that the engine multiplies by the blackout fade
+// factor (~0.094 at the dim minimum). The UBO rotates addresses every
+// frame so we can't pin a static address — we pin by (pipeline, size,
+// cb_idx) instead, and overwrite the four byte offsets with the
+// post-recovery Munnar baseline values captured from a bright-state
+// snapshot.
+//
+// If the pin visually lifts the blackout, these four floats are the
+// single point where the fade multiplier lands in GPU-visible state.
+bool IsDcLightPinEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("SHADPS4_DC_LIGHT_PIN");
+        const bool v = env && env[0] == '1' && env[1] == '\0';
+        if (v) {
+            LOG_INFO(Render_Vulkan, "[dc-lightpin] enabled (SHADPS4_DC_LIGHT_PIN=1)");
+        }
+        return v;
+    }();
+    return enabled;
+}
+
+// SHADPS4_DC_LIGHT_PIN_WINDOW — submits after first-arm to keep the
+// pin active. Default 1200 (~20s @ 60fps). Bump higher for slow
+// time-lapse settings (timelapse 1x can need 60+ seconds). Set 0 to
+// disable auto-expiry entirely.
+u64 GetDcLightPinWindow() {
+    static const u64 w = [] {
+        const char* env = std::getenv("SHADPS4_DC_LIGHT_PIN_WINDOW");
+        u64 v = env && env[0] ? std::strtoull(env, nullptr, 0) : 6000ull;
+        LOG_INFO(Render_Vulkan,
+                 "[dc-lightpin] auto-expire window = {} submits "
+                 "(SHADPS4_DC_LIGHT_PIN_WINDOW)", v);
+        return v;
+    }();
+    return w;
+}
+
+// When SHADPS4_DC_LIGHT_PIN_FILE=<path> is set, load that file at
+// startup into a 1936-byte snapshot. Phase 26 overshooting experiment:
+// if a matching UBO is bound and its content signature checks out,
+// *entirely* overwrite it with the loaded bytes (instead of pinning 4
+// specific floats). Proves whether the whole UBO is the visible lever.
+const std::array<u8, 1936>* GetDcLightPinSnapshot() {
+    static const std::array<u8, 1936>* snap = [] () -> const std::array<u8, 1936>* {
+        const char* env = std::getenv("SHADPS4_DC_LIGHT_PIN_FILE");
+        if (!env || !env[0]) return nullptr;
+        static std::array<u8, 1936> buf{};
+        std::FILE* fp = std::fopen(env, "rb");
+        if (!fp) {
+            LOG_WARNING(Render_Vulkan,
+                        "[dc-lightpin] snapshot file {} missing", env);
+            return nullptr;
+        }
+        const size_t n = std::fread(buf.data(), 1, buf.size(), fp);
+        std::fclose(fp);
+        if (n != buf.size()) {
+            LOG_WARNING(Render_Vulkan,
+                        "[dc-lightpin] snapshot file {} short read "
+                        "{}/{}", env, n, buf.size());
+            return nullptr;
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[dc-lightpin] snapshot overwrite enabled from {}", env);
+        return &buf;
+    }();
+    return snap;
+}
+
+// Phase 26b: second fade UBO, 224 bytes, carries a sun/light transform
+// plus a 4-vector at offset 0x40 (wait: offsets 0xc0-0xcc) that drops
+// 97% from bright to the "pinned-then-dim" state. Distinctive content
+// signature: floats at [0]=5.79, [4]=3, [8]≈5.79e-7.
+const std::array<u8, 224>* GetDcLightPinSnapshot224() {
+    static const std::array<u8, 224>* snap = [] () -> const std::array<u8, 224>* {
+        const char* env = std::getenv("SHADPS4_DC_LIGHT_PIN_FILE_224");
+        if (!env || !env[0]) return nullptr;
+        static std::array<u8, 224> buf{};
+        std::FILE* fp = std::fopen(env, "rb");
+        if (!fp) return nullptr;
+        const size_t n = std::fread(buf.data(), 1, buf.size(), fp);
+        std::fclose(fp);
+        if (n != buf.size()) return nullptr;
+        LOG_INFO(Render_Vulkan,
+                 "[dc-lightpin-224] snapshot overwrite enabled from {}", env);
+        return &buf;
+    }();
+    return snap;
+}
+
+bool MaybePinDriveclubSunLightUbo(VAddr base, u64 size, u32 cb_idx) {
+    if (!IsDcLightPinEnabled()) return false;
+    if (!IsDriveclubGuardEnabled()) return false;
+    if (g_driveclub_race_window.load() == 0) return false;
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return false;
+    }
+    // Three-state lifecycle mirroring the 1936-byte pin, using vc8
+    // (offset 0xc8) as the blackout signal — dim ≈ 0.01, recovered
+    // ≈ 0.29, so threshold at 0.05 engaged / 0.20 recovered.
+    {
+        static std::atomic<u32> state{0};
+        static std::atomic<u64> first_engaged{0};
+        if (state.load() == 2) return false;
+        float vc8 = 0.f;
+        if (size >= 0xc8 + sizeof(float)) {
+            vc8 = *reinterpret_cast<const float*>(
+                reinterpret_cast<const u8*>(base) + 0xc8);
+        }
+        const u64 submit = g_driveclub_submit_index.load();
+        if (state.load() == 0) {
+            if (vc8 >= 0.f && vc8 < 0.05f) {
+                state.store(1);
+                first_engaged.store(submit);
+            } else {
+                return false;
+            }
+        }
+        if (vc8 >= 0.20f) {
+            state.store(2);
+            return false;
+        }
+        const u64 window = GetDcLightPinWindow();
+        if (window > 0 && submit - first_engaged.load() > window) {
+            state.store(2);
+            return false;
+        }
+    }
+    if (size != 224) return false;
+    if (g_driveclub_current_draw_kind.load() !=
+        static_cast<u8>(DriveclubDrawKind::Scene)) return false;
+    if (base == 0) return false;
+    (void)cb_idx;
+
+    // Signature check at known-stable offsets: the non-animated part of
+    // this UBO has distinctive float values we can use as a fingerprint.
+    auto* b = reinterpret_cast<u8*>(base);
+    const float f0 = *reinterpret_cast<const float*>(b + 0x0);
+    const float f4 = *reinterpret_cast<const float*>(b + 0x10);
+    const float f8 = *reinterpret_cast<const float*>(b + 0x20);
+    if (!(f0 > 4.5f && f0 < 7.0f)) return false;       // [0] ~ 5.79
+    if (!(f4 > 2.5f && f4 < 3.5f)) return false;       // [4] == 3
+    if (!(f8 > 1e-8f && f8 < 1e-5f)) return false;     // [8] ~ 5.79e-7
+
+    bool touched = false;
+    if (const auto* snap = GetDcLightPinSnapshot224()) {
+        std::memcpy(b, snap->data(), snap->size());
+        touched = true;
+    } else {
+        // Four specific offsets that drop 97% at dim — slot [48-51].
+        struct S { size_t off; float v; };
+        constexpr S slots[] = {
+            {0xc0, 0.7483f},
+            {0xc4, -0.7483f},
+            {0xc8, 0.28996f},
+            {0xcc, 0.064498f},
+        };
+        for (const auto& s : slots) {
+            auto* f = reinterpret_cast<float*>(b + s.off);
+            if (std::abs(*f) < 0.5f * std::abs(s.v)) {
+                *f = s.v;
+                touched = true;
+            }
+        }
+    }
+    if (touched) {
+        static std::mutex m;
+        static u64 last_log_submit = 0;
+        const u64 submit = g_driveclub_submit_index.load();
+        std::lock_guard l{m};
+        if (submit - last_log_submit >= 60) {
+            last_log_submit = submit;
+            LOG_INFO(Render_Vulkan,
+                     "[dc-lightpin-224] submit={} addr={:#x} applied",
+                     submit, base);
+        }
+    }
+    return touched;
+}
+
+// Returns true when at least one slot was rewritten; the caller must
+// then invalidate the buffer_cache range so the write propagates to
+// Vulkan's upload of this buffer.
+bool MaybePinDriveclubLightFade(VAddr base, u64 size, u32 cb_idx) {
+    if (!IsDcLightPinEnabled()) return false;
+    if (!IsDriveclubGuardEnabled()) return false;
+    if (g_driveclub_race_window.load() == 0) return false;
+    const u32 arm_threshold = GetDcNukeAfterArm();
+    if (arm_threshold > 0 && g_driveclub_arm_count.load() < arm_threshold) {
+        return false;
+    }
+    // Three-state lifecycle on game's incoming v98 at offset 0x98:
+    //   0 = idle       — haven't seen the blackout yet. Skip pin.
+    //   1 = engaged    — saw v98 < dim threshold. Pin fires now.
+    //   2 = expired    — saw v98 >= recovered threshold after engaging.
+    //                     Permanent release, natural TOD takes over.
+    // Timelapse-agnostic because state transitions follow the game's
+    // own animation state. The env window is a safety upper-bound.
+    {
+        static std::atomic<u32> state{0};
+        static std::atomic<u64> first_engaged{0};
+        if (state.load() == 2) return false;
+        float v98 = 0.f;
+        if (size >= 0x98 + sizeof(float)) {
+            v98 = *reinterpret_cast<const float*>(
+                reinterpret_cast<const u8*>(base) + 0x98);
+        }
+        const u64 submit = g_driveclub_submit_index.load();
+        if (state.load() == 0) {
+            if (v98 >= 0.f && v98 < 15.f) {
+                state.store(1);
+                first_engaged.store(submit);
+                LOG_INFO(Render_Vulkan,
+                         "[dc-lightpin] engaged at submit {} (blackout "
+                         "confirmed, v98={:.2f})",
+                         submit, v98);
+            } else {
+                return false;  // still idle — don't touch pre-race
+                               // state.
+            }
+        }
+        // state == 1 (engaged). Check for recovery.
+        if (v98 >= 40.f) {
+            state.store(2);
+            LOG_INFO(Render_Vulkan,
+                     "[dc-lightpin] content-expired at submit {} "
+                     "(game reached recovered state, v98={:.2f})",
+                     submit, v98);
+            return false;
+        }
+        // Safety upper-bound via env (default 6000 ≈ 100s @ 60fps).
+        const u64 window = GetDcLightPinWindow();
+        if (window > 0 && submit - first_engaged.load() > window) {
+            state.store(2);
+            LOG_INFO(Render_Vulkan,
+                     "[dc-lightpin] safety-expired at submit {} "
+                     "(window={} submits)", submit, window);
+            return false;
+        }
+    }
+    // Match the 1936-byte scene-lighting UBO. The three-way snapshot
+    // diff showed this buffer bound at many (pipeline, cb_idx) combos
+    // — cb0..cb9 across ~50 scene pipelines all see the same fade
+    // curve. So we filter ONLY by size here, then use a content check
+    // below to avoid touching unrelated 1936-byte buffers.
+    if (size != 1936) return false;
+    if (g_driveclub_current_draw_kind.load() !=
+        static_cast<u8>(DriveclubDrawKind::Scene)) return false;
+    if (base == 0) return false;
+    (void)cb_idx;
+
+    // Byte offsets identified by the bright/dim/recovered three-way
+    // diff on Munnar India 19:30. The "recovered" value is what the
+    // game settles on after the blackout animation completes; pinning
+    // to it should look visually correct on that track.
+    struct PinSlot { size_t off; float value; };
+    constexpr PinSlot slots[] = {
+        {0x98, 59.9375f},
+        {0xc0, -20.4998f},
+        {0xc8, 56.3229f},
+        {0xf4, 0.000999009f},
+    };
+
+    auto* base_bytes = reinterpret_cast<u8*>(base);
+    // Content sanity: the 1936-byte buffers are used by other systems
+    // too, so before rewriting, verify the signature is plausible —
+    // offset 0x98 is a small positive-ish scalar in a known range, and
+    // offset 0xc0 is negative. Unrelated buffers won't coincidentally
+    // hit that combination.
+    auto read = [&](size_t off) -> float {
+        return *reinterpret_cast<const float*>(base_bytes + off);
+    };
+    const float v98 = read(0x98);
+    const float vc0 = read(0xc0);
+    const float vc8 = read(0xc8);
+    if (!(v98 >= 0.f && v98 <= 200.f)) return false;
+    if (!(vc0 <= 0.f && vc0 >= -80.f)) return false;
+    if (!(vc8 >= 0.f && vc8 <= 200.f)) return false;
+
+    bool touched = false;
+
+    // Overshoot-verify mode: if a snapshot file is loaded, overwrite
+    // the entire 1936-byte UBO with the recovered-state content. This
+    // proves whether the whole UBO is the visible lever.
+    if (const auto* snap = GetDcLightPinSnapshot()) {
+        std::memcpy(base_bytes, snap->data(), snap->size());
+        touched = true;
+    } else {
+        for (const auto& s : slots) {
+            if (s.off + sizeof(float) > size) continue;
+            auto* f = reinterpret_cast<float*>(base_bytes + s.off);
+            const float prev = *f;
+            // Only rewrite when the current value is meaningfully below
+            // the recovered value — leaves already-bright state alone.
+            if (std::abs(prev) < 0.5f * std::abs(s.value)) {
+                *f = s.value;
+                touched = true;
+            }
+        }
+    }
+    if (touched) {
+        static std::mutex log_mutex;
+        static u64 last_log_submit = 0;
+        const u64 submit = g_driveclub_submit_index.load();
+        std::lock_guard lock{log_mutex};
+        if (submit - last_log_submit >= 60) {
+            last_log_submit = submit;
+            LOG_INFO(Render_Vulkan,
+                     "[dc-lightpin] submit={} pipe={:#018x} addr={:#x} "
+                     "pinned slots",
+                     submit, pipe, base);
+        }
+    }
+    return touched;
+}
+
 void MaybePinDriveclubExposure(VAddr base, u64 size, u32 cb_idx) {
     if (!IsDcExposurePinEnabled()) return;
     if (!IsDriveclubGuardEnabled()) return;
@@ -2749,6 +3183,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         } else {
             MaybeDumpDriveclubTonemapSsbo(vsharp.base_address, size, i);
             MaybePinDriveclubExposure(vsharp.base_address, size, i);
+            MaybeUboSnapshotDriveclub(vsharp.base_address, size, i);
+            if (MaybePinDriveclubLightFade(vsharp.base_address, size, i)) {
+                buffer_cache.InvalidateMemory(vsharp.base_address, size);
+            }
+            if (MaybePinDriveclubSunLightUbo(vsharp.base_address, size, i)) {
+                buffer_cache.InvalidateMemory(vsharp.base_address, size);
+            }
             if (MaybeSmashDriveclubUbo(vsharp.base_address, size, i,
                                        desc.is_written, desc.is_formatted)) {
                 buffer_cache.InvalidateMemory(vsharp.base_address, size);

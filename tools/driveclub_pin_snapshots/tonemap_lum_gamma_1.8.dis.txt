@@ -1,0 +1,1580 @@
+; SPIR-V
+; Version: 1.6
+; Generator: Khronos SPIR-V Tools Assembler; 0
+; Bound: 1189
+; Schema: 0
+               OpCapability StorageImageExtendedFormats
+               OpCapability StorageImageReadWithoutFormat
+               OpCapability UniformAndStorageBuffer8BitAccess
+               OpCapability Int16
+               OpCapability Int8
+               OpCapability Int64
+               OpCapability ImageQuery
+               OpCapability StorageImageWriteWithoutFormat
+               OpCapability Sampled1D
+               OpCapability Image1D
+               OpCapability UniformAndStorageBuffer16BitAccess
+               OpCapability Shader
+               OpExtension "SPV_KHR_float_controls"
+          %1 = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %2 "main" %push_data %gl_WorkGroupID %gl_LocalInvocationID %ssbo_1 %ssbo_2 %ssbo_3 %ssbo_4 %ssbo_5 %cs_img88 %cs_img72 %cs_img80 %cs_img24 %cs_img32 %cs_img124 %cs_img40 %cs_img56 %cs_img48 %cs_img64 %cs_img116 %cs_sampsgpr_100 %cs_sampsgpr_96 %cs_sampsgpr_0
+               OpExecutionMode %2 LocalSize 16 16 1
+         %25 = OpString "0x2c918c06"
+               OpName %void_id "void_id"
+               OpName %bool_id "bool_id"
+               OpName %u8_id "u8_id"
+               OpName %i8_id "i8_id"
+               OpName %u16_id "u16_id"
+               OpName %i16_id "i16_id"
+               OpName %f32_id "f32_id"
+               OpName %i32_id "i32_id"
+               OpName %u32_id "u32_id"
+               OpName %u64_id "u64_id"
+               OpName %f32vec2_id "f32vec2_id"
+               OpName %i32vec2_id "i32vec2_id"
+               OpName %u32vec2_id "u32vec2_id"
+               OpName %bvec2_id "bvec2_id"
+               OpName %f32vec3_id "f32vec3_id"
+               OpName %i32vec3_id "i32vec3_id"
+               OpName %u32vec3_id "u32vec3_id"
+               OpName %bvec3_id "bvec3_id"
+               OpName %f32vec4_id "f32vec4_id"
+               OpName %i32vec4_id "i32vec4_id"
+               OpName %u32vec4_id "u32vec4_id"
+               OpName %bvec4_id "bvec4_id"
+               OpName %input_f32 "input_f32"
+               OpName %input_u32 "input_u32"
+               OpName %input_s32 "input_s32"
+               OpName %output_f32 "output_f32"
+               OpName %output_u32 "output_u32"
+               OpName %output_s32 "output_s32"
+               OpName %full_result_i32x2 "full_result_i32x2"
+               OpName %full_result_u32x2 "full_result_u32x2"
+               OpName %frexp_result_f32 "frexp_result_f32"
+               OpName %AuxData "AuxData"
+               OpMemberName %AuxData 0 "xoffset"
+               OpMemberName %AuxData 1 "yoffset"
+               OpMemberName %AuxData 2 "xscale"
+               OpMemberName %AuxData 3 "yscale"
+               OpMemberName %AuxData 4 "ud_regs0"
+               OpMemberName %AuxData 5 "ud_regs1"
+               OpMemberName %AuxData 6 "ud_regs2"
+               OpMemberName %AuxData 7 "ud_regs3"
+               OpMemberName %AuxData 8 "buf_offsets0"
+               OpMemberName %AuxData 9 "buf_offsets1"
+               OpMemberName %AuxData 10 "buf_offsets2"
+               OpName %push_data "push_data"
+               OpMemberName %_struct_58 0 "data"
+               OpName %ssbo_1 "ssbo_1"
+               OpName %ssbo_2 "ssbo_2"
+               OpName %ssbo_3 "ssbo_3"
+               OpName %ssbo_4 "ssbo_4"
+               OpName %ssbo_5 "ssbo_5"
+               OpName %cs_img88 "cs_img88"
+               OpName %cs_img72 "cs_img72"
+               OpName %cs_img80 "cs_img80"
+               OpName %cs_img24 "cs_img24"
+               OpName %cs_img32 "cs_img32"
+               OpName %cs_img124 "cs_img124"
+               OpName %cs_img40 "cs_img40"
+               OpName %cs_img56 "cs_img56"
+               OpName %cs_img48 "cs_img48"
+               OpName %cs_img64 "cs_img64"
+               OpName %cs_img116 "cs_img116"
+               OpName %cs_sampsgpr_100 "cs_sampsgpr:100"
+               OpName %cs_sampsgpr_96 "cs_sampsgpr:96"
+               OpName %cs_sampsgpr_0 "cs_sampsgpr:0"
+               OpName %buf0_off "buf0_off"
+               OpName %buf0_dword_off "buf0_dword_off"
+               OpName %buf1_off "buf1_off"
+               OpName %buf1_dword_off "buf1_dword_off"
+               OpName %buf2_off "buf2_off"
+               OpName %buf2_dword_off "buf2_dword_off"
+               OpName %buf3_off "buf3_off"
+               OpName %buf3_dword_off "buf3_dword_off"
+               OpName %buf4_off "buf4_off"
+               OpName %buf4_dword_off "buf4_dword_off"
+               OpDecorate %AuxData Block
+               OpMemberDecorate %AuxData 0 Offset 0
+               OpMemberDecorate %AuxData 1 Offset 4
+               OpMemberDecorate %AuxData 2 Offset 8
+               OpMemberDecorate %AuxData 3 Offset 12
+               OpMemberDecorate %AuxData 4 Offset 16
+               OpMemberDecorate %AuxData 5 Offset 32
+               OpMemberDecorate %AuxData 6 Offset 48
+               OpMemberDecorate %AuxData 7 Offset 64
+               OpMemberDecorate %AuxData 8 Offset 80
+               OpMemberDecorate %AuxData 9 Offset 96
+               OpMemberDecorate %AuxData 10 Offset 112
+               OpDecorate %gl_WorkGroupID BuiltIn WorkgroupId
+               OpDecorate %gl_LocalInvocationID BuiltIn LocalInvocationId
+               OpDecorate %_runtimearr_u32_id ArrayStride 4
+               OpDecorate %_struct_58 Block
+               OpMemberDecorate %_struct_58 0 Offset 0
+               OpDecorate %ssbo_1 Binding 0
+               OpDecorate %ssbo_1 DescriptorSet 0
+               OpDecorate %ssbo_1 NonWritable
+               OpDecorate %ssbo_2 Binding 1
+               OpDecorate %ssbo_2 DescriptorSet 0
+               OpDecorate %ssbo_2 NonWritable
+               OpDecorate %ssbo_3 Binding 2
+               OpDecorate %ssbo_3 DescriptorSet 0
+               OpDecorate %ssbo_3 NonWritable
+               OpDecorate %ssbo_4 Binding 3
+               OpDecorate %ssbo_4 DescriptorSet 0
+               OpDecorate %ssbo_4 NonWritable
+               OpDecorate %ssbo_5 Binding 4
+               OpDecorate %ssbo_5 DescriptorSet 0
+               OpDecorate %ssbo_5 NonWritable
+               OpDecorate %cs_img88 Binding 5
+               OpDecorate %cs_img88 DescriptorSet 0
+               OpDecorate %cs_img72 Binding 6
+               OpDecorate %cs_img72 DescriptorSet 0
+               OpDecorate %cs_img80 Binding 7
+               OpDecorate %cs_img80 DescriptorSet 0
+               OpDecorate %cs_img24 Binding 8
+               OpDecorate %cs_img24 DescriptorSet 0
+               OpDecorate %cs_img32 Binding 9
+               OpDecorate %cs_img32 DescriptorSet 0
+               OpDecorate %cs_img124 Binding 10
+               OpDecorate %cs_img124 DescriptorSet 0
+               OpDecorate %cs_img40 Binding 11
+               OpDecorate %cs_img40 DescriptorSet 0
+               OpDecorate %cs_img56 Binding 12
+               OpDecorate %cs_img56 DescriptorSet 0
+               OpDecorate %cs_img48 Binding 13
+               OpDecorate %cs_img48 DescriptorSet 0
+               OpDecorate %cs_img64 Binding 14
+               OpDecorate %cs_img64 DescriptorSet 0
+               OpDecorate %cs_img116 Binding 15
+               OpDecorate %cs_img116 DescriptorSet 0
+               OpDecorate %cs_sampsgpr_100 Binding 16
+               OpDecorate %cs_sampsgpr_100 DescriptorSet 0
+               OpDecorate %cs_sampsgpr_96 Binding 17
+               OpDecorate %cs_sampsgpr_96 DescriptorSet 0
+               OpDecorate %cs_sampsgpr_0 Binding 18
+               OpDecorate %cs_sampsgpr_0 DescriptorSet 0
+               OpDecorate %70 NoContraction
+               OpDecorate %71 NoContraction
+               OpDecorate %72 NoContraction
+               OpDecorate %73 NoContraction
+               OpDecorate %74 NoContraction
+               OpDecorate %75 NoContraction
+               OpDecorate %76 NoContraction
+               OpDecorate %77 NoContraction
+               OpDecorate %78 NoContraction
+               OpDecorate %79 NoContraction
+               OpDecorate %80 NoContraction
+               OpDecorate %81 NoContraction
+               OpDecorate %82 NoContraction
+               OpDecorate %83 NoContraction
+               OpDecorate %84 NoContraction
+               OpDecorate %85 NoContraction
+               OpDecorate %86 NoContraction
+               OpDecorate %87 NoContraction
+               OpDecorate %88 NoContraction
+               OpDecorate %89 NoContraction
+               OpDecorate %90 NoContraction
+               OpDecorate %91 NoContraction
+               OpDecorate %92 NoContraction
+               OpDecorate %93 NoContraction
+               OpDecorate %94 NoContraction
+               OpDecorate %95 NoContraction
+               OpDecorate %96 NoContraction
+               OpDecorate %97 NoContraction
+               OpDecorate %98 NoContraction
+               OpDecorate %99 NoContraction
+               OpDecorate %100 NoContraction
+               OpDecorate %101 NoContraction
+               OpDecorate %102 NoContraction
+               OpDecorate %103 NoContraction
+               OpDecorate %104 NoContraction
+               OpDecorate %105 NoContraction
+               OpDecorate %106 NoContraction
+               OpDecorate %107 NoContraction
+               OpDecorate %108 NoContraction
+               OpDecorate %109 NoContraction
+               OpDecorate %110 NoContraction
+               OpDecorate %111 NoContraction
+               OpDecorate %112 NoContraction
+               OpDecorate %113 NoContraction
+               OpDecorate %114 NoContraction
+               OpDecorate %115 NoContraction
+               OpDecorate %116 NoContraction
+               OpDecorate %117 NoContraction
+               OpDecorate %118 NoContraction
+               OpDecorate %119 NoContraction
+               OpDecorate %120 NoContraction
+               OpDecorate %121 NoContraction
+               OpDecorate %122 NoContraction
+               OpDecorate %123 NoContraction
+               OpDecorate %124 NoContraction
+               OpDecorate %125 NoContraction
+               OpDecorate %126 NoContraction
+               OpDecorate %127 NoContraction
+               OpDecorate %128 NoContraction
+               OpDecorate %129 NoContraction
+               OpDecorate %130 NoContraction
+               OpDecorate %131 NoContraction
+               OpDecorate %132 NoContraction
+               OpDecorate %133 NoContraction
+               OpDecorate %134 NoContraction
+               OpDecorate %135 NoContraction
+               OpDecorate %136 NoContraction
+               OpDecorate %137 NoContraction
+               OpDecorate %138 NoContraction
+               OpDecorate %139 NoContraction
+               OpDecorate %140 NoContraction
+               OpDecorate %141 NoContraction
+               OpDecorate %142 NoContraction
+               OpDecorate %143 NoContraction
+               OpDecorate %144 NoContraction
+               OpDecorate %145 NoContraction
+               OpDecorate %146 NoContraction
+               OpDecorate %147 NoContraction
+               OpDecorate %148 NoContraction
+               OpDecorate %149 NoContraction
+               OpDecorate %150 NoContraction
+               OpDecorate %151 NoContraction
+               OpDecorate %152 NoContraction
+               OpDecorate %153 NoContraction
+               OpDecorate %154 NoContraction
+               OpDecorate %155 NoContraction
+               OpDecorate %156 NoContraction
+               OpDecorate %157 NoContraction
+               OpDecorate %158 NoContraction
+               OpDecorate %159 NoContraction
+               OpDecorate %160 NoContraction
+               OpDecorate %161 NoContraction
+               OpDecorate %162 NoContraction
+               OpDecorate %163 NoContraction
+               OpDecorate %164 NoContraction
+               OpDecorate %165 NoContraction
+               OpDecorate %166 NoContraction
+               OpDecorate %167 NoContraction
+               OpDecorate %168 NoContraction
+               OpDecorate %169 NoContraction
+               OpDecorate %170 NoContraction
+               OpDecorate %171 NoContraction
+               OpDecorate %172 NoContraction
+               OpDecorate %173 NoContraction
+               OpDecorate %174 NoContraction
+               OpDecorate %175 NoContraction
+               OpDecorate %176 NoContraction
+               OpDecorate %177 NoContraction
+               OpDecorate %178 NoContraction
+               OpDecorate %179 NoContraction
+               OpDecorate %180 NoContraction
+               OpDecorate %181 NoContraction
+               OpDecorate %182 NoContraction
+               OpDecorate %183 NoContraction
+               OpDecorate %184 NoContraction
+               OpDecorate %185 NoContraction
+               OpDecorate %186 NoContraction
+               OpDecorate %187 NoContraction
+               OpDecorate %188 NoContraction
+               OpDecorate %189 NoContraction
+               OpDecorate %190 NoContraction
+               OpDecorate %191 NoContraction
+               OpDecorate %192 NoContraction
+               OpDecorate %193 NoContraction
+               OpDecorate %194 NoContraction
+               OpDecorate %195 NoContraction
+               OpDecorate %196 NoContraction
+               OpDecorate %197 NoContraction
+               OpDecorate %198 NoContraction
+               OpDecorate %199 NoContraction
+               OpDecorate %200 NoContraction
+               OpDecorate %201 NoContraction
+               OpDecorate %202 NoContraction
+               OpDecorate %203 NoContraction
+               OpDecorate %204 NoContraction
+               OpDecorate %205 NoContraction
+               OpDecorate %206 NoContraction
+               OpDecorate %207 NoContraction
+               OpDecorate %208 NoContraction
+               OpDecorate %209 NoContraction
+               OpDecorate %210 NoContraction
+               OpDecorate %211 NoContraction
+               OpDecorate %212 NoContraction
+               OpDecorate %213 NoContraction
+               OpDecorate %214 NoContraction
+               OpDecorate %215 NoContraction
+               OpDecorate %216 NoContraction
+               OpDecorate %217 NoContraction
+               OpDecorate %218 NoContraction
+               OpDecorate %219 NoContraction
+               OpDecorate %220 NoContraction
+               OpDecorate %221 NoContraction
+               OpDecorate %222 NoContraction
+               OpDecorate %223 NoContraction
+               OpDecorate %224 NoContraction
+               OpDecorate %225 NoContraction
+               OpDecorate %226 NoContraction
+               OpDecorate %227 NoContraction
+               OpDecorate %228 NoContraction
+               OpDecorate %229 NoContraction
+               OpDecorate %230 NoContraction
+               OpDecorate %231 NoContraction
+               OpDecorate %232 NoContraction
+               OpDecorate %233 NoContraction
+               OpDecorate %234 NoContraction
+               OpDecorate %235 NoContraction
+               OpDecorate %236 NoContraction
+               OpDecorate %237 NoContraction
+               OpDecorate %238 NoContraction
+               OpDecorate %239 NoContraction
+               OpDecorate %240 NoContraction
+               OpDecorate %241 NoContraction
+               OpDecorate %242 NoContraction
+               OpDecorate %243 NoContraction
+               OpDecorate %244 NoContraction
+               OpDecorate %245 NoContraction
+               OpDecorate %246 NoContraction
+               OpDecorate %247 NoContraction
+               OpDecorate %248 NoContraction
+               OpDecorate %249 NoContraction
+               OpDecorate %250 NoContraction
+               OpDecorate %251 NoContraction
+               OpDecorate %252 NoContraction
+               OpDecorate %253 NoContraction
+    %void_id = OpTypeVoid
+    %bool_id = OpTypeBool
+      %u8_id = OpTypeInt 8 0
+      %i8_id = OpTypeInt 8 1
+     %u16_id = OpTypeInt 16 0
+     %i16_id = OpTypeInt 16 1
+     %f32_id = OpTypeFloat 32
+     %i32_id = OpTypeInt 32 1
+     %u32_id = OpTypeInt 32 0
+     %u64_id = OpTypeInt 64 0
+ %f32vec2_id = OpTypeVector %f32_id 2
+ %i32vec2_id = OpTypeVector %i32_id 2
+ %u32vec2_id = OpTypeVector %u32_id 2
+   %bvec2_id = OpTypeVector %bool_id 2
+ %f32vec3_id = OpTypeVector %f32_id 3
+ %i32vec3_id = OpTypeVector %i32_id 3
+ %u32vec3_id = OpTypeVector %u32_id 3
+   %bvec3_id = OpTypeVector %bool_id 3
+ %f32vec4_id = OpTypeVector %f32_id 4
+ %i32vec4_id = OpTypeVector %i32_id 4
+ %u32vec4_id = OpTypeVector %u32_id 4
+   %bvec4_id = OpTypeVector %bool_id 4
+       %true = OpConstantTrue %bool_id
+      %false = OpConstantFalse %bool_id
+    %u8_id_1 = OpConstant %u8_id 1
+    %u8_id_0 = OpConstant %u8_id 0
+   %u16_id_0 = OpConstant %u16_id 0
+   %u32_id_1 = OpConstant %u32_id 1
+   %u32_id_0 = OpConstant %u32_id 0
+   %f32_id_0 = OpConstant %f32_id 0
+   %u64_id_1 = OpConstant %u64_id 1
+   %u64_id_0 = OpConstant %u64_id 0
+%f32_id_6_28318548 = OpConstant %f32_id 6.28318548
+  %input_f32 = OpTypePointer Input %f32_id
+  %input_u32 = OpTypePointer Input %u32_id
+  %input_s32 = OpTypePointer Input %i32_id
+ %output_f32 = OpTypePointer Output %f32_id
+ %output_u32 = OpTypePointer Output %u32_id
+ %output_s32 = OpTypePointer Output %i32_id
+%full_result_i32x2 = OpTypeStruct %i32_id %i32_id
+%full_result_u32x2 = OpTypeStruct %u32_id %u32_id
+%frexp_result_f32 = OpTypeStruct %f32_id %i32_id
+    %AuxData = OpTypeStruct %f32_id %f32_id %f32_id %f32_id %u32vec4_id %u32vec4_id %u32vec4_id %u32vec4_id %u32vec4_id %u32vec4_id %u32vec2_id
+%_ptr_PushConstant_AuxData = OpTypePointer PushConstant %AuxData
+%_ptr_Input_u32vec3_id = OpTypePointer Input %u32vec3_id
+%u32_id_16368 = OpConstant %u32_id 16368
+%_runtimearr_u32_id = OpTypeRuntimeArray %u32_id
+ %_struct_58 = OpTypeStruct %_runtimearr_u32_id
+%_ptr_StorageBuffer__struct_58 = OpTypePointer StorageBuffer %_struct_58
+%_ptr_StorageBuffer_u32_id = OpTypePointer StorageBuffer %u32_id
+        %270 = OpTypeImage %f32_id 2D 0 0 0 1 Unknown
+%_ptr_UniformConstant_270 = OpTypePointer UniformConstant %270
+        %272 = OpTypeSampledImage %270
+        %273 = OpTypeImage %f32_id 2D 0 1 0 1 Unknown
+%_ptr_UniformConstant_273 = OpTypePointer UniformConstant %273
+        %275 = OpTypeSampledImage %273
+        %276 = OpTypeImage %f32_id 2D 0 0 0 2 Unknown
+%_ptr_UniformConstant_276 = OpTypePointer UniformConstant %276
+        %278 = OpTypeSampler
+%_ptr_UniformConstant_278 = OpTypePointer UniformConstant %278
+        %280 = OpTypeFunction %void_id
+%_ptr_PushConstant_u32_id = OpTypePointer PushConstant %u32_id
+   %u32_id_8 = OpConstant %u32_id 8
+   %u32_id_2 = OpConstant %u32_id 2
+  %u32_id_16 = OpConstant %u32_id 16
+  %u32_id_24 = OpConstant %u32_id 24
+  %u32_id_22 = OpConstant %u32_id 22
+  %u32_id_23 = OpConstant %u32_id 23
+  %u32_id_15 = OpConstant %u32_id 15
+   %u32_id_4 = OpConstant %u32_id 4
+ %u32_id_100 = OpConstant %u32_id 100
+  %u32_id_18 = OpConstant %u32_id 18
+  %u32_id_19 = OpConstant %u32_id 19
+  %u32_id_20 = OpConstant %u32_id 20
+  %u32_id_21 = OpConstant %u32_id 21
+   %u32_id_9 = OpConstant %u32_id 9
+  %u32_id_10 = OpConstant %u32_id 10
+  %u32_id_11 = OpConstant %u32_id 11
+ %f32_id_0_5 = OpConstant %f32_id 0.5
+ %u32_id_118 = OpConstant %u32_id 118
+ %u32_id_119 = OpConstant %u32_id 119
+  %u32_id_48 = OpConstant %u32_id 48
+  %u32_id_53 = OpConstant %u32_id 53
+  %u32_id_56 = OpConstant %u32_id 56
+  %u32_id_57 = OpConstant %u32_id 57
+  %u32_id_59 = OpConstant %u32_id 59
+  %u32_id_63 = OpConstant %u32_id 63
+   %f32_id_1 = OpConstant %f32_id 1
+  %u32_id_32 = OpConstant %u32_id 32
+  %u32_id_33 = OpConstant %u32_id 33
+  %u32_id_34 = OpConstant %u32_id 34
+  %u32_id_36 = OpConstant %u32_id 36
+  %u32_id_37 = OpConstant %u32_id 37
+  %u32_id_38 = OpConstant %u32_id 38
+  %u32_id_40 = OpConstant %u32_id 40
+  %u32_id_41 = OpConstant %u32_id 41
+  %u32_id_42 = OpConstant %u32_id 42
+  %u32_id_44 = OpConstant %u32_id 44
+  %u32_id_45 = OpConstant %u32_id 45
+  %u32_id_46 = OpConstant %u32_id 46
+ %u32_id_108 = OpConstant %u32_id 108
+ %u32_id_109 = OpConstant %u32_id 109
+ %u32_id_110 = OpConstant %u32_id 110
+   %f32_id_2 = OpConstant %f32_id 2
+  %f32_id_n1 = OpConstant %f32_id -1
+ %f32_id_255 = OpConstant %f32_id 255
+   %f32_id_8 = OpConstant %f32_id 8
+   %f32_id_6 = OpConstant %f32_id 6
+  %u32_id_96 = OpConstant %u32_id 96
+  %u32_id_92 = OpConstant %u32_id 92
+%f32_id_0x1pn149 = OpConstant %f32_id 0x1p-149
+ %u32_id_128 = OpConstant %u32_id 128
+   %u32_id_5 = OpConstant %u32_id 5
+   %u32_id_6 = OpConstant %u32_id 6
+  %u32_id_12 = OpConstant %u32_id 12
+  %u32_id_13 = OpConstant %u32_id 13
+  %u32_id_14 = OpConstant %u32_id 14
+  %u32_id_64 = OpConstant %u32_id 64
+%f32_id_0_360000014 = OpConstant %f32_id 0.360000014
+ %f32_id_n15 = OpConstant %f32_id -15
+  %f32_id_10 = OpConstant %f32_id 10
+  %u32_id_72 = OpConstant %u32_id 72
+  %u32_id_80 = OpConstant %u32_id 80
+%f32_id_0_800000012 = OpConstant %f32_id 0.800000012
+  %u32_id_88 = OpConstant %u32_id 88
+ %f32_id_1_5 = OpConstant %f32_id 1.5
+%f32_id_0_298900008 = OpConstant %f32_id 0.298900008
+%f32_id_0_587000012 = OpConstant %f32_id 0.587000012
+%f32_id_0_114100002 = OpConstant %f32_id 0.114100002
+%f32_id_0_555559993 = OpConstant %f32_id 0.555559993
+%f32_id_9_99999975en06 = OpConstant %f32_id 9.99999975e-06
+   %f32_id_3 = OpConstant %f32_id 3
+   %f32_id_5 = OpConstant %f32_id 5
+   %f32_id_4 = OpConstant %f32_id 4
+        %354 = OpConstantComposite %f32vec4_id %f32_id_0 %f32_id_1 %f32_id_0 %f32_id_0
+  %f32_id_n5 = OpConstant %f32_id -5
+%u32_id_1065353216 = OpConstant %u32_id 1065353216
+  %push_data = OpVariable %_ptr_PushConstant_AuxData PushConstant
+%gl_WorkGroupID = OpVariable %_ptr_Input_u32vec3_id Input
+%gl_LocalInvocationID = OpVariable %_ptr_Input_u32vec3_id Input
+     %ssbo_1 = OpVariable %_ptr_StorageBuffer__struct_58 StorageBuffer
+     %ssbo_2 = OpVariable %_ptr_StorageBuffer__struct_58 StorageBuffer
+     %ssbo_3 = OpVariable %_ptr_StorageBuffer__struct_58 StorageBuffer
+     %ssbo_4 = OpVariable %_ptr_StorageBuffer__struct_58 StorageBuffer
+     %ssbo_5 = OpVariable %_ptr_StorageBuffer__struct_58 StorageBuffer
+   %cs_img88 = OpVariable %_ptr_UniformConstant_270 UniformConstant
+   %cs_img72 = OpVariable %_ptr_UniformConstant_270 UniformConstant
+   %cs_img80 = OpVariable %_ptr_UniformConstant_270 UniformConstant
+   %cs_img24 = OpVariable %_ptr_UniformConstant_273 UniformConstant
+   %cs_img32 = OpVariable %_ptr_UniformConstant_273 UniformConstant
+  %cs_img124 = OpVariable %_ptr_UniformConstant_276 UniformConstant
+   %cs_img40 = OpVariable %_ptr_UniformConstant_273 UniformConstant
+   %cs_img56 = OpVariable %_ptr_UniformConstant_270 UniformConstant
+   %cs_img48 = OpVariable %_ptr_UniformConstant_273 UniformConstant
+   %cs_img64 = OpVariable %_ptr_UniformConstant_270 UniformConstant
+  %cs_img116 = OpVariable %_ptr_UniformConstant_276 UniformConstant
+%cs_sampsgpr_100 = OpVariable %_ptr_UniformConstant_278 UniformConstant
+%cs_sampsgpr_96 = OpVariable %_ptr_UniformConstant_278 UniformConstant
+%cs_sampsgpr_0 = OpVariable %_ptr_UniformConstant_278 UniformConstant
+          %2 = OpFunction %void_id None %280
+        %357 = OpLabel
+        %358 = OpAccessChain %_ptr_PushConstant_u32_id %push_data %u32_id_8 %u32_id_0
+        %359 = OpLoad %u32_id %358
+   %buf0_off = OpBitFieldUExtract %u32_id %359 %u32_id_0 %u32_id_8
+%buf0_dword_off = OpShiftRightLogical %u32_id %buf0_off %u32_id_2
+        %360 = OpAccessChain %_ptr_PushConstant_u32_id %push_data %u32_id_8 %u32_id_0
+        %361 = OpLoad %u32_id %360
+   %buf1_off = OpBitFieldUExtract %u32_id %361 %u32_id_8 %u32_id_8
+%buf1_dword_off = OpShiftRightLogical %u32_id %buf1_off %u32_id_2
+        %362 = OpAccessChain %_ptr_PushConstant_u32_id %push_data %u32_id_8 %u32_id_0
+        %363 = OpLoad %u32_id %362
+   %buf2_off = OpBitFieldUExtract %u32_id %363 %u32_id_16 %u32_id_8
+%buf2_dword_off = OpShiftRightLogical %u32_id %buf2_off %u32_id_2
+        %364 = OpAccessChain %_ptr_PushConstant_u32_id %push_data %u32_id_8 %u32_id_0
+        %365 = OpLoad %u32_id %364
+   %buf3_off = OpBitFieldUExtract %u32_id %365 %u32_id_24 %u32_id_8
+%buf3_dword_off = OpShiftRightLogical %u32_id %buf3_off %u32_id_2
+        %366 = OpAccessChain %_ptr_PushConstant_u32_id %push_data %u32_id_8 %u32_id_1
+        %367 = OpLoad %u32_id %366
+   %buf4_off = OpBitFieldUExtract %u32_id %367 %u32_id_0 %u32_id_8
+%buf4_dword_off = OpShiftRightLogical %u32_id %buf4_off %u32_id_2
+        %368 = OpLoad %u32vec3_id %gl_LocalInvocationID
+        %369 = OpCompositeExtract %u32_id %368 0
+        %370 = OpLoad %u32vec3_id %gl_LocalInvocationID
+        %371 = OpCompositeExtract %u32_id %370 1
+        %372 = OpLoad %u32vec3_id %gl_WorkGroupID
+        %373 = OpCompositeExtract %u32_id %372 0
+        %374 = OpLoad %u32vec3_id %gl_WorkGroupID
+        %375 = OpCompositeExtract %u32_id %374 1
+        %376 = OpIMul %u32_id %373 %u32_id_16
+        %377 = OpIMul %u32_id %375 %u32_id_16
+        %378 = OpIAdd %u32_id %u32_id_22 %buf0_dword_off
+        %379 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %378
+        %380 = OpLoad %u32_id %379
+        %381 = OpIAdd %u32_id %u32_id_23 %buf0_dword_off
+        %382 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %381
+        %383 = OpLoad %u32_id %382
+        %384 = OpIAdd %u32_id %376 %369
+        %385 = OpIAdd %u32_id %377 %371
+        %386 = OpULessThanEqual %bool_id %383 %385
+        %387 = OpULessThanEqual %bool_id %380 %384
+        %388 = OpLogicalOr %bool_id %387 %386
+        %389 = OpLogicalNot %bool_id %388
+        %390 = OpLogicalNot %bool_id %388
+               OpSelectionMerge %391 None
+               OpBranchConditional %390 %392 %391
+        %392 = OpLabel
+        %393 = OpIAdd %u32_id %380 %u32_id_15
+        %394 = OpShiftRightLogical %u32_id %393 %u32_id_4
+        %395 = OpIMul %u32_id %394 %375
+        %396 = OpIAdd %u32_id %373 %395
+        %397 = OpIMul %u32_id %396 %u32_id_100
+        %398 = OpIAdd %u32_id %u32_id_18 %buf0_dword_off
+        %399 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %398
+        %400 = OpLoad %u32_id %399
+        %401 = OpIAdd %u32_id %u32_id_19 %buf0_dword_off
+        %402 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %401
+        %403 = OpLoad %u32_id %402
+        %404 = OpIAdd %u32_id %u32_id_20 %buf0_dword_off
+        %405 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %404
+        %406 = OpLoad %u32_id %405
+        %407 = OpIAdd %u32_id %u32_id_21 %buf0_dword_off
+        %408 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %407
+        %409 = OpLoad %u32_id %408
+        %410 = OpIAdd %u32_id %u32_id_8 %buf0_dword_off
+        %411 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %410
+        %412 = OpLoad %u32_id %411
+        %413 = OpIAdd %u32_id %u32_id_9 %buf0_dword_off
+        %414 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %413
+        %415 = OpLoad %u32_id %414
+        %416 = OpIAdd %u32_id %u32_id_10 %buf0_dword_off
+        %417 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %416
+        %418 = OpLoad %u32_id %417
+        %419 = OpIAdd %u32_id %u32_id_11 %buf0_dword_off
+        %420 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_1 %u32_id_0 %419
+        %421 = OpLoad %u32_id %420
+        %422 = OpShiftRightLogical %u32_id %397 %u32_id_2
+        %423 = OpIAdd %u32_id %422 %buf1_dword_off
+        %424 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_2 %u32_id_0 %423
+        %425 = OpLoad %u32_id %424
+        %426 = OpIAdd %u32_id %406 %384
+        %427 = OpIAdd %u32_id %409 %385
+        %428 = OpConvertUToF %f32_id %426
+         %70 = OpFAdd %f32_id %f32_id_0_5 %428
+        %429 = OpBitcast %f32_id %412
+         %71 = OpFMul %f32_id %429 %70
+        %430 = OpIAdd %u32_id %u32_id_118 %buf2_dword_off
+        %431 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %430
+        %432 = OpLoad %u32_id %431
+        %433 = OpIAdd %u32_id %u32_id_119 %buf2_dword_off
+        %434 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %433
+        %435 = OpLoad %u32_id %434
+        %436 = OpConvertUToF %f32_id %385
+         %72 = OpFAdd %f32_id %f32_id_0_5 %436
+        %437 = OpConvertUToF %f32_id %384
+        %438 = OpBitcast %f32_id %421
+         %73 = OpFMul %f32_id %438 %72
+        %439 = OpConvertUToF %f32_id %427
+         %74 = OpFAdd %f32_id %f32_id_0_5 %439
+        %440 = OpBitcast %f32_id %415
+         %75 = OpFMul %f32_id %440 %74
+        %441 = OpCompositeConstruct %f32vec2_id %71 %75
+        %442 = OpLoad %270 %cs_img88
+        %443 = OpLoad %278 %cs_sampsgpr_100
+        %444 = OpSampledImage %272 %442 %443
+        %445 = OpImageSampleExplicitLod %f32vec4_id %444 %441 Lod %f32_id_0
+        %446 = OpCompositeExtract %f32_id %445 0
+        %447 = OpCompositeConstruct %f32vec2_id %71 %75
+        %448 = OpLoad %270 %cs_img72
+        %449 = OpLoad %278 %cs_sampsgpr_100
+        %450 = OpSampledImage %272 %448 %449
+        %451 = OpImageSampleExplicitLod %f32vec4_id %450 %447 Lod %f32_id_0
+        %452 = OpCompositeExtract %f32_id %451 0
+        %453 = OpCompositeExtract %f32_id %451 1
+        %454 = OpCompositeExtract %f32_id %451 2
+        %455 = OpIAdd %u32_id %u32_id_48 %buf2_dword_off
+        %456 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %455
+        %457 = OpLoad %u32_id %456
+        %458 = OpIAdd %u32_id %u32_id_53 %buf2_dword_off
+        %459 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %458
+        %460 = OpLoad %u32_id %459
+        %461 = OpIAdd %u32_id %u32_id_56 %buf2_dword_off
+        %462 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %461
+        %463 = OpLoad %u32_id %462
+        %464 = OpIAdd %u32_id %u32_id_57 %buf2_dword_off
+        %465 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %464
+        %466 = OpLoad %u32_id %465
+        %467 = OpIAdd %u32_id %u32_id_59 %buf2_dword_off
+        %468 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %467
+        %469 = OpLoad %u32_id %468
+        %470 = OpIAdd %u32_id %u32_id_63 %buf2_dword_off
+        %471 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %470
+        %472 = OpLoad %u32_id %471
+         %76 = OpFAdd %f32_id %f32_id_0_5 %437
+        %473 = OpCompositeConstruct %f32vec2_id %71 %75
+        %474 = OpLoad %270 %cs_img80
+        %475 = OpLoad %278 %cs_sampsgpr_100
+        %476 = OpSampledImage %272 %474 %475
+        %477 = OpImageSampleExplicitLod %f32vec4_id %476 %473 Lod %f32_id_0
+        %478 = OpCompositeExtract %f32_id %477 0
+        %479 = OpCompositeExtract %f32_id %477 1
+        %480 = OpCompositeExtract %f32_id %477 3
+        %481 = OpBitcast %f32_id %460
+        %482 = OpFDiv %f32_id %f32_id_1 %481
+        %483 = OpBitcast %f32_id %457
+        %484 = OpFDiv %f32_id %f32_id_1 %483
+        %485 = OpBitcast %f32_id %466
+         %77 = OpFAdd %f32_id %f32_id_1 %485
+        %486 = OpIAdd %u32_id %u32_id_32 %buf2_dword_off
+        %487 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %486
+        %488 = OpLoad %u32_id %487
+        %489 = OpIAdd %u32_id %u32_id_33 %buf2_dword_off
+        %490 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %489
+        %491 = OpLoad %u32_id %490
+        %492 = OpIAdd %u32_id %u32_id_34 %buf2_dword_off
+        %493 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %492
+        %494 = OpLoad %u32_id %493
+        %495 = OpIAdd %u32_id %u32_id_36 %buf2_dword_off
+        %496 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %495
+        %497 = OpLoad %u32_id %496
+        %498 = OpIAdd %u32_id %u32_id_37 %buf2_dword_off
+        %499 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %498
+        %500 = OpLoad %u32_id %499
+        %501 = OpIAdd %u32_id %u32_id_38 %buf2_dword_off
+        %502 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %501
+        %503 = OpLoad %u32_id %502
+        %504 = OpIAdd %u32_id %u32_id_40 %buf2_dword_off
+        %505 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %504
+        %506 = OpLoad %u32_id %505
+        %507 = OpIAdd %u32_id %u32_id_41 %buf2_dword_off
+        %508 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %507
+        %509 = OpLoad %u32_id %508
+        %510 = OpIAdd %u32_id %u32_id_42 %buf2_dword_off
+        %511 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %510
+        %512 = OpLoad %u32_id %511
+        %513 = OpIAdd %u32_id %u32_id_44 %buf2_dword_off
+        %514 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %513
+        %515 = OpLoad %u32_id %514
+        %516 = OpIAdd %u32_id %u32_id_45 %buf2_dword_off
+        %517 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %516
+        %518 = OpLoad %u32_id %517
+        %519 = OpIAdd %u32_id %u32_id_46 %buf2_dword_off
+        %520 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %519
+        %521 = OpLoad %u32_id %520
+        %522 = OpBitcast %f32_id %463
+         %78 = OpFSub %f32_id %f32_id_1 %522
+        %523 = OpBitcast %f32_id %466
+         %79 = OpFSub %f32_id %f32_id_1 %523
+        %524 = OpBitcast %f32_id %463
+         %80 = OpFAdd %f32_id %f32_id_1 %524
+        %525 = OpIAdd %u32_id %u32_id_108 %buf2_dword_off
+        %526 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %525
+        %527 = OpLoad %u32_id %526
+        %528 = OpIAdd %u32_id %u32_id_109 %buf2_dword_off
+        %529 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %528
+        %530 = OpLoad %u32_id %529
+        %531 = OpIAdd %u32_id %u32_id_110 %buf2_dword_off
+        %532 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_3 %u32_id_0 %531
+        %533 = OpLoad %u32_id %532
+        %534 = OpBitcast %f32_id %432
+        %535 = OpBitcast %f32_id %435
+         %81 = OpExtInst %f32_id %1 Fma %534 %446 %535
+        %536 = OpFDiv %f32_id %f32_id_1 %81
+        %537 = OpBitcast %f32_id %469
+        %538 = OpBitcast %f32_id %472
+         %82 = OpExtInst %f32_id %1 Fma %537 %536 %538
+         %83 = OpFMul %f32_id %482 %82
+         %84 = OpFMul %f32_id %83 %77
+        %539 = OpFNegate %f32_id %82
+         %85 = OpFMul %f32_id %539 %482
+        %540 = OpFNegate %f32_id %84
+         %86 = OpExtInst %f32_id %1 Fma %85 %79 %540
+         %87 = OpExtInst %f32_id %1 Fma %73 %86 %84
+        %541 = OpFNegate %f32_id %82
+         %88 = OpFMul %f32_id %541 %484
+         %89 = OpFMul %f32_id %88 %78
+         %90 = OpFMul %f32_id %484 %82
+        %542 = OpFNegate %f32_id %89
+         %91 = OpExtInst %f32_id %1 Fma %90 %80 %542
+        %543 = OpBitcast %f32_id %506
+        %544 = OpBitcast %f32_id %515
+         %92 = OpExtInst %f32_id %1 Fma %543 %536 %544
+         %93 = OpFMul %f32_id %91 %76
+        %545 = OpBitcast %f32_id %497
+         %94 = OpExtInst %f32_id %1 Fma %545 %87 %92
+        %546 = OpBitcast %f32_id %418
+         %95 = OpExtInst %f32_id %1 Fma %546 %93 %89
+        %547 = OpBitcast %f32_id %509
+        %548 = OpBitcast %f32_id %518
+         %96 = OpExtInst %f32_id %1 Fma %547 %536 %548
+        %549 = OpBitcast %f32_id %488
+         %97 = OpExtInst %f32_id %1 Fma %549 %95 %94
+        %550 = OpBitcast %f32_id %500
+         %98 = OpExtInst %f32_id %1 Fma %550 %87 %96
+        %551 = OpBitcast %f32_id %512
+        %552 = OpBitcast %f32_id %521
+         %99 = OpExtInst %f32_id %1 Fma %551 %536 %552
+        %100 = OpFMul %f32_id %97 %97
+        %553 = OpBitcast %f32_id %491
+        %101 = OpExtInst %f32_id %1 Fma %553 %95 %98
+        %554 = OpBitcast %f32_id %503
+        %102 = OpExtInst %f32_id %1 Fma %554 %87 %99
+        %103 = OpExtInst %f32_id %1 Fma %101 %101 %100
+        %555 = OpBitcast %f32_id %494
+        %104 = OpExtInst %f32_id %1 Fma %555 %95 %102
+        %105 = OpExtInst %f32_id %1 Fma %104 %104 %103
+        %556 = OpExtInst %f32_id %1 InverseSqrt %105
+        %106 = OpFMul %f32_id %556 %97
+        %107 = OpExtInst %f32_id %1 Fma %f32_id_2 %452 %f32_id_n1
+        %108 = OpExtInst %f32_id %1 Fma %f32_id_2 %478 %f32_id_n1
+        %557 = OpExtInst %f32_id %1 FClamp %108 %f32_id_0 %f32_id_1
+        %109 = OpFMul %f32_id %106 %107
+        %110 = OpFMul %f32_id %556 %101
+        %558 = OpExtInst %f32_id %1 Log2 %557
+        %111 = OpFMul %f32_id %f32_id_255 %480
+        %112 = OpFMul %f32_id %556 %104
+        %113 = OpExtInst %f32_id %1 Fma %f32_id_2 %454 %f32_id_n1
+        %114 = OpFMul %f32_id %f32_id_8 %558
+        %559 = OpConvertFToU %u32_id %111
+        %115 = OpExtInst %f32_id %1 Fma %f32_id_2 %453 %f32_id_n1
+        %116 = OpExtInst %f32_id %1 Fma %115 %110 %109
+        %117 = OpExtInst %f32_id %1 Fma %113 %112 %116
+        %118 = OpFMul %f32_id %117 %f32_id_2
+        %560 = OpExtInst %f32_id %1 Exp2 %114
+        %561 = OpBitwiseAnd %u32_id %u32_id_63 %559
+        %562 = OpFNegate %f32_id %107
+        %119 = OpExtInst %f32_id %1 Fma %562 %118 %106
+        %563 = OpBitcast %f32_id %527
+        %120 = OpFAdd %f32_id %563 %97
+        %564 = OpBitcast %f32_id %530
+        %121 = OpFAdd %f32_id %564 %101
+        %565 = OpFNegate %f32_id %115
+        %122 = OpExtInst %f32_id %1 Fma %565 %118 %110
+        %566 = OpBitcast %f32_id %533
+        %123 = OpFAdd %f32_id %566 %104
+        %567 = OpFNegate %f32_id %113
+        %124 = OpExtInst %f32_id %1 Fma %567 %118 %112
+        %568 = OpFNegate %f32_id %560
+        %125 = OpExtInst %f32_id %1 Fma %f32_id_6 %568 %f32_id_6
+        %569 = OpIEqual %bool_id %u32_id_0 %561
+        %126 = OpFMul %f32_id %f32_id_2 %478
+               OpBranch %570
+        %570 = OpLabel
+        %571 = OpPhi %u32_id %u32_id_0 %392 %572 %573
+        %574 = OpPhi %u32_id %u32_id_0 %392 %575 %573
+        %576 = OpPhi %u32_id %u32_id_0 %392 %577 %573
+        %578 = OpPhi %u32_id %u32_id_0 %392 %579 %573
+        %580 = OpPhi %u32_id %u32_id_0 %392 %581 %573
+        %582 = OpPhi %u32_id %u32_id_0 %392 %583 %573
+        %584 = OpPhi %u32_id %u32_id_1065353216 %392 %585 %573
+        %586 = OpPhi %u32_id %u32_id_0 %392 %587 %573
+               OpLoopMerge %588 %573 None
+               OpBranch %589
+        %589 = OpLabel
+        %590 = OpULessThan %bool_id %586 %425
+        %591 = OpLogicalNot %bool_id %590
+               OpBranchConditional %591 %588 %592
+        %592 = OpLabel
+        %593 = OpIMul %u32_id %586 %u32_id_4
+        %594 = OpIAdd %u32_id %593 %u32_id_4
+        %595 = OpIMul %u32_id %396 %u32_id_100
+        %596 = OpIAdd %u32_id %595 %594
+        %597 = OpShiftRightLogical %u32_id %596 %u32_id_2
+        %598 = OpIAdd %u32_id %597 %buf1_dword_off
+        %599 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_2 %u32_id_0 %598
+        %600 = OpLoad %u32_id %599
+        %601 = OpIMul %u32_id %600 %u32_id_96
+        %602 = OpIAdd %u32_id %601 %u32_id_92
+        %603 = OpShiftRightLogical %u32_id %602 %u32_id_2
+        %604 = OpIAdd %u32_id %603 %buf3_dword_off
+        %605 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %604
+        %606 = OpLoad %u32_id %605
+        %607 = OpSelect %f32_id %569 %f32_id_0 %f32_id_0x1pn149
+        %608 = OpBitcast %u32_id %607
+        %609 = OpBitwiseAnd %u32_id %606 %u32_id_128
+        %610 = OpINotEqual %bool_id %609 %u32_id_0
+        %611 = OpIEqual %bool_id %u32_id_0 %608
+        %612 = OpSelect %bool_id %610 %389 %false
+        %613 = OpLogicalAnd %bool_id %612 %611
+        %614 = OpLogicalNot %bool_id %613
+        %615 = OpLogicalAnd %bool_id %389 %614
+               OpSelectionMerge %616 None
+               OpBranchConditional %615 %617 %616
+        %617 = OpLabel
+        %618 = OpIMul %u32_id %600 %u32_id_96
+        %619 = OpShiftRightLogical %u32_id %618 %u32_id_2
+        %620 = OpIAdd %u32_id %619 %buf3_dword_off
+        %621 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %620
+        %622 = OpLoad %u32_id %621
+        %623 = OpIAdd %u32_id %619 %u32_id_1
+        %624 = OpIAdd %u32_id %623 %buf3_dword_off
+        %625 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %624
+        %626 = OpLoad %u32_id %625
+        %627 = OpIAdd %u32_id %619 %u32_id_2
+        %628 = OpIAdd %u32_id %627 %buf3_dword_off
+        %629 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %628
+        %630 = OpLoad %u32_id %629
+        %631 = OpIAdd %u32_id %619 %u32_id_4
+        %632 = OpIAdd %u32_id %631 %buf3_dword_off
+        %633 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %632
+        %634 = OpLoad %u32_id %633
+        %635 = OpIAdd %u32_id %619 %u32_id_5
+        %636 = OpIAdd %u32_id %635 %buf3_dword_off
+        %637 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %636
+        %638 = OpLoad %u32_id %637
+        %639 = OpIAdd %u32_id %619 %u32_id_6
+        %640 = OpIAdd %u32_id %639 %buf3_dword_off
+        %641 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %640
+        %642 = OpLoad %u32_id %641
+        %643 = OpIAdd %u32_id %619 %u32_id_8
+        %644 = OpIAdd %u32_id %643 %buf3_dword_off
+        %645 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %644
+        %646 = OpLoad %u32_id %645
+        %647 = OpIAdd %u32_id %619 %u32_id_9
+        %648 = OpIAdd %u32_id %647 %buf3_dword_off
+        %649 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %648
+        %650 = OpLoad %u32_id %649
+        %651 = OpIAdd %u32_id %619 %u32_id_10
+        %652 = OpIAdd %u32_id %651 %buf3_dword_off
+        %653 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %652
+        %654 = OpLoad %u32_id %653
+        %655 = OpIAdd %u32_id %619 %u32_id_12
+        %656 = OpIAdd %u32_id %655 %buf3_dword_off
+        %657 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %656
+        %658 = OpLoad %u32_id %657
+        %659 = OpIAdd %u32_id %619 %u32_id_13
+        %660 = OpIAdd %u32_id %659 %buf3_dword_off
+        %661 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %660
+        %662 = OpLoad %u32_id %661
+        %663 = OpIAdd %u32_id %619 %u32_id_14
+        %664 = OpIAdd %u32_id %663 %buf3_dword_off
+        %665 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %664
+        %666 = OpLoad %u32_id %665
+        %667 = OpBitcast %f32_id %646
+        %668 = OpBitcast %f32_id %658
+        %127 = OpExtInst %f32_id %1 Fma %667 %123 %668
+        %669 = OpBitcast %f32_id %634
+        %128 = OpExtInst %f32_id %1 Fma %669 %121 %127
+        %670 = OpBitcast %f32_id %622
+        %129 = OpExtInst %f32_id %1 Fma %670 %120 %128
+        %671 = OpBitwiseAnd %u32_id %606 %u32_id_64
+        %672 = OpINotEqual %bool_id %671 %u32_id_0
+        %673 = OpSelect %u32_id %672 %u32_id_1 %u32_id_0
+        %674 = OpIAdd %u32_id %618 %u32_id_64
+        %675 = OpShiftRightLogical %u32_id %674 %u32_id_2
+        %676 = OpIAdd %u32_id %675 %buf3_dword_off
+        %677 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %676
+        %678 = OpLoad %u32_id %677
+        %679 = OpIAdd %u32_id %675 %u32_id_1
+        %680 = OpIAdd %u32_id %679 %buf3_dword_off
+        %681 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %680
+        %682 = OpLoad %u32_id %681
+        %683 = OpFOrdLessThanEqual %bool_id %f32_id_0 %129
+        %684 = OpSelect %f32_id %683 %f32_id_0 %f32_id_0x1pn149
+        %685 = OpBitcast %u32_id %684
+        %686 = OpBitwiseAnd %u32_id %673 %685
+        %687 = OpINotEqual %bool_id %u32_id_0 %686
+        %688 = OpBitcast %f32_id %400
+        %689 = OpBitcast %f32_id %678
+        %690 = OpSelect %f32_id %687 %688 %689
+        %691 = OpBitcast %f32_id %403
+        %692 = OpBitcast %f32_id %682
+        %693 = OpSelect %f32_id %687 %691 %692
+        %694 = OpExtInst %f32_id %1 FAbs %129
+        %130 = OpExtInst %f32_id %1 Fma %690 %694 %693
+        %695 = OpExtInst %f32_id %1 FClamp %130 %f32_id_0 %f32_id_1
+        %696 = OpBitcast %u32_id %695
+        %697 = OpLogicalAnd %bool_id %615 %683
+               OpSelectionMerge %698 None
+               OpBranchConditional %697 %699 %698
+        %699 = OpLabel
+        %700 = OpBitwiseAnd %u32_id %606 %u32_id_1
+        %701 = OpINotEqual %bool_id %700 %u32_id_0
+               OpSelectionMerge %702 None
+               OpBranchConditional %701 %703 %702
+        %703 = OpLabel
+        %704 = OpExtInst %f32_id %1 Log2 %695
+        %131 = OpFMul %f32_id %f32_id_0_360000014 %704
+        %705 = OpExtInst %f32_id %1 Exp2 %131
+        %706 = OpExtInst %f32_id %1 FClamp %705 %f32_id_0 %f32_id_1
+        %132 = OpExtInst %f32_id %1 Fma %f32_id_6 %706 %f32_id_n15
+        %133 = OpFMul %f32_id %706 %706
+        %134 = OpExtInst %f32_id %1 Fma %132 %706 %f32_id_10
+        %135 = OpFMul %f32_id %133 %706
+        %136 = OpFMul %f32_id %135 %134
+        %707 = OpBitcast %u32_id %136
+               OpBranch %702
+        %702 = OpLabel
+        %708 = OpPhi %u32_id %707 %703 %696 %699
+               OpBranch %698
+        %698 = OpLabel
+        %709 = OpPhi %u32_id %708 %702 %696 %617
+        %710 = OpLogicalNot %bool_id %697
+        %711 = OpLogicalAnd %bool_id %615 %710
+               OpSelectionMerge %712 None
+               OpBranchConditional %711 %713 %712
+        %713 = OpLabel
+        %714 = OpBitwiseAnd %u32_id %606 %u32_id_2
+        %715 = OpINotEqual %bool_id %714 %u32_id_0
+               OpSelectionMerge %716 None
+               OpBranchConditional %715 %717 %716
+        %717 = OpLabel
+        %718 = OpBitcast %f32_id %709
+        %719 = OpExtInst %f32_id %1 Log2 %718
+        %137 = OpFMul %f32_id %f32_id_0_360000014 %719
+        %720 = OpExtInst %f32_id %1 Exp2 %137
+        %721 = OpExtInst %f32_id %1 FClamp %720 %f32_id_0 %f32_id_1
+        %138 = OpExtInst %f32_id %1 Fma %f32_id_6 %721 %f32_id_n15
+        %139 = OpFMul %f32_id %721 %721
+        %140 = OpExtInst %f32_id %1 Fma %138 %721 %f32_id_10
+        %141 = OpFMul %f32_id %139 %721
+        %142 = OpFMul %f32_id %141 %140
+        %722 = OpBitcast %u32_id %142
+               OpBranch %716
+        %716 = OpLabel
+        %723 = OpPhi %u32_id %722 %717 %709 %713
+               OpBranch %712
+        %712 = OpLabel
+        %724 = OpPhi %u32_id %723 %716 %709 %698
+        %725 = OpBitcast %f32_id %650
+        %726 = OpBitcast %f32_id %662
+        %143 = OpExtInst %f32_id %1 Fma %725 %123 %726
+        %727 = OpIMul %u32_id %600 %u32_id_96
+        %728 = OpBitcast %f32_id %638
+        %144 = OpExtInst %f32_id %1 Fma %728 %121 %143
+        %729 = OpIAdd %u32_id %727 %u32_id_72
+        %730 = OpBitcast %f32_id %626
+        %145 = OpExtInst %f32_id %1 Fma %730 %120 %144
+        %731 = OpShiftRightLogical %u32_id %729 %u32_id_2
+        %732 = OpIAdd %u32_id %731 %buf3_dword_off
+        %733 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %732
+        %734 = OpLoad %u32_id %733
+        %735 = OpIAdd %u32_id %731 %u32_id_1
+        %736 = OpIAdd %u32_id %735 %buf3_dword_off
+        %737 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %736
+        %738 = OpLoad %u32_id %737
+        %739 = OpFOrdLessThanEqual %bool_id %f32_id_0 %145
+        %740 = OpBitcast %f32_id %734
+        %741 = OpExtInst %f32_id %1 FAbs %145
+        %742 = OpBitcast %f32_id %738
+        %146 = OpExtInst %f32_id %1 Fma %740 %741 %742
+        %743 = OpExtInst %f32_id %1 FClamp %146 %f32_id_0 %f32_id_1
+        %744 = OpBitcast %u32_id %743
+        %745 = OpLogicalAnd %bool_id %615 %739
+               OpSelectionMerge %746 None
+               OpBranchConditional %745 %747 %746
+        %747 = OpLabel
+        %748 = OpBitwiseAnd %u32_id %606 %u32_id_4
+        %749 = OpINotEqual %bool_id %748 %u32_id_0
+               OpSelectionMerge %750 None
+               OpBranchConditional %749 %751 %750
+        %751 = OpLabel
+        %752 = OpExtInst %f32_id %1 Log2 %743
+        %147 = OpFMul %f32_id %f32_id_0_360000014 %752
+        %753 = OpExtInst %f32_id %1 Exp2 %147
+        %754 = OpExtInst %f32_id %1 FClamp %753 %f32_id_0 %f32_id_1
+        %148 = OpExtInst %f32_id %1 Fma %f32_id_6 %754 %f32_id_n15
+        %149 = OpFMul %f32_id %754 %754
+        %150 = OpExtInst %f32_id %1 Fma %148 %754 %f32_id_10
+        %151 = OpFMul %f32_id %149 %754
+        %152 = OpFMul %f32_id %151 %150
+        %755 = OpBitcast %u32_id %152
+               OpBranch %750
+        %750 = OpLabel
+        %756 = OpPhi %u32_id %755 %751 %744 %747
+               OpBranch %746
+        %746 = OpLabel
+        %757 = OpPhi %u32_id %756 %750 %744 %712
+        %758 = OpLogicalNot %bool_id %745
+        %759 = OpLogicalAnd %bool_id %615 %758
+               OpSelectionMerge %760 None
+               OpBranchConditional %759 %761 %760
+        %761 = OpLabel
+        %762 = OpBitwiseAnd %u32_id %606 %u32_id_8
+        %763 = OpINotEqual %bool_id %762 %u32_id_0
+               OpSelectionMerge %764 None
+               OpBranchConditional %763 %765 %764
+        %765 = OpLabel
+        %766 = OpBitcast %f32_id %757
+        %767 = OpExtInst %f32_id %1 Log2 %766
+        %153 = OpFMul %f32_id %f32_id_0_360000014 %767
+        %768 = OpExtInst %f32_id %1 Exp2 %153
+        %769 = OpExtInst %f32_id %1 FClamp %768 %f32_id_0 %f32_id_1
+        %154 = OpExtInst %f32_id %1 Fma %f32_id_6 %769 %f32_id_n15
+        %155 = OpFMul %f32_id %769 %769
+        %156 = OpExtInst %f32_id %1 Fma %154 %769 %f32_id_10
+        %157 = OpFMul %f32_id %155 %769
+        %158 = OpFMul %f32_id %157 %156
+        %770 = OpBitcast %u32_id %158
+               OpBranch %764
+        %764 = OpLabel
+        %771 = OpPhi %u32_id %770 %765 %757 %761
+               OpBranch %760
+        %760 = OpLabel
+        %772 = OpPhi %u32_id %771 %764 %757 %746
+        %773 = OpBitcast %f32_id %654
+        %774 = OpBitcast %f32_id %666
+        %159 = OpExtInst %f32_id %1 Fma %773 %123 %774
+        %775 = OpIMul %u32_id %600 %u32_id_96
+        %776 = OpBitcast %f32_id %642
+        %160 = OpExtInst %f32_id %1 Fma %776 %121 %159
+        %777 = OpIAdd %u32_id %775 %u32_id_80
+        %778 = OpBitcast %f32_id %630
+        %161 = OpExtInst %f32_id %1 Fma %778 %120 %160
+        %779 = OpFOrdLessThanEqual %bool_id %f32_id_0 %161
+        %780 = OpShiftRightLogical %u32_id %777 %u32_id_2
+        %781 = OpIAdd %u32_id %780 %buf3_dword_off
+        %782 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %781
+        %783 = OpLoad %u32_id %782
+        %784 = OpIAdd %u32_id %780 %u32_id_1
+        %785 = OpIAdd %u32_id %784 %buf3_dword_off
+        %786 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %785
+        %787 = OpLoad %u32_id %786
+        %788 = OpBitcast %f32_id %783
+        %789 = OpExtInst %f32_id %1 FAbs %161
+        %790 = OpBitcast %f32_id %787
+        %162 = OpExtInst %f32_id %1 Fma %788 %789 %790
+        %791 = OpExtInst %f32_id %1 FClamp %162 %f32_id_0 %f32_id_1
+        %792 = OpBitcast %u32_id %791
+        %793 = OpLogicalAnd %bool_id %615 %779
+               OpSelectionMerge %794 None
+               OpBranchConditional %793 %795 %794
+        %795 = OpLabel
+        %796 = OpBitwiseAnd %u32_id %606 %u32_id_16
+        %797 = OpINotEqual %bool_id %796 %u32_id_0
+               OpSelectionMerge %798 None
+               OpBranchConditional %797 %799 %798
+        %799 = OpLabel
+        %800 = OpExtInst %f32_id %1 Log2 %791
+        %163 = OpFMul %f32_id %f32_id_0_360000014 %800
+        %801 = OpExtInst %f32_id %1 Exp2 %163
+        %802 = OpExtInst %f32_id %1 FClamp %801 %f32_id_0 %f32_id_1
+        %164 = OpExtInst %f32_id %1 Fma %f32_id_6 %802 %f32_id_n15
+        %165 = OpFMul %f32_id %802 %802
+        %166 = OpExtInst %f32_id %1 Fma %164 %802 %f32_id_10
+        %167 = OpFMul %f32_id %165 %802
+        %168 = OpFMul %f32_id %167 %166
+        %803 = OpBitcast %u32_id %168
+               OpBranch %798
+        %798 = OpLabel
+        %804 = OpPhi %u32_id %803 %799 %792 %795
+               OpBranch %794
+        %794 = OpLabel
+        %805 = OpPhi %u32_id %804 %798 %792 %760
+        %806 = OpLogicalNot %bool_id %793
+        %807 = OpLogicalAnd %bool_id %615 %806
+               OpSelectionMerge %808 None
+               OpBranchConditional %807 %809 %808
+        %809 = OpLabel
+        %810 = OpBitwiseAnd %u32_id %606 %u32_id_32
+        %811 = OpINotEqual %bool_id %810 %u32_id_0
+               OpSelectionMerge %812 None
+               OpBranchConditional %811 %813 %812
+        %813 = OpLabel
+        %814 = OpBitcast %f32_id %805
+        %815 = OpExtInst %f32_id %1 Log2 %814
+        %169 = OpFMul %f32_id %f32_id_0_800000012 %815
+        %816 = OpExtInst %f32_id %1 Exp2 %169
+        %817 = OpExtInst %f32_id %1 FClamp %816 %f32_id_0 %f32_id_1
+        %170 = OpExtInst %f32_id %1 Fma %f32_id_6 %817 %f32_id_n15
+        %171 = OpFMul %f32_id %817 %817
+        %172 = OpExtInst %f32_id %1 Fma %170 %817 %f32_id_10
+        %173 = OpFMul %f32_id %171 %817
+        %174 = OpFMul %f32_id %173 %172
+        %818 = OpBitcast %u32_id %174
+               OpBranch %812
+        %812 = OpLabel
+        %819 = OpPhi %u32_id %818 %813 %805 %809
+               OpBranch %808
+        %808 = OpLabel
+        %820 = OpPhi %u32_id %819 %812 %805 %794
+        %821 = OpIMul %u32_id %600 %u32_id_96
+        %822 = OpIAdd %u32_id %821 %u32_id_88
+        %823 = OpShiftRightLogical %u32_id %822 %u32_id_2
+        %824 = OpIAdd %u32_id %823 %buf3_dword_off
+        %825 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_4 %u32_id_0 %824
+        %826 = OpLoad %u32_id %825
+        %827 = OpFOrdLessThan %bool_id %115 %f32_id_0
+        %828 = OpFNegate %f32_id %115
+        %829 = OpFNegate %f32_id %113
+        %830 = OpSelect %f32_id %827 %829 %113
+        %831 = OpExtInst %f32_id %1 FAbs %107
+        %832 = OpExtInst %f32_id %1 FAbs %115
+        %833 = OpExtInst %f32_id %1 FAbs %113
+        %834 = OpFOrdGreaterThanEqual %bool_id %833 %831
+        %835 = OpFOrdGreaterThanEqual %bool_id %833 %832
+        %836 = OpLogicalAnd %bool_id %834 %835
+        %837 = OpFOrdGreaterThanEqual %bool_id %832 %831
+        %838 = OpSelect %f32_id %837 %830 %828
+        %839 = OpSelect %f32_id %836 %828 %838
+        %840 = OpExtInst %f32_id %1 FAbs %129
+        %175 = OpFAdd %f32_id %f32_id_0 %840
+        %841 = OpExtInst %f32_id %1 FAbs %145
+        %176 = OpFAdd %f32_id %f32_id_0 %841
+        %842 = OpFOrdGreaterThanEqual %bool_id %f32_id_1 %175
+        %843 = OpExtInst %f32_id %1 FAbs %161
+        %177 = OpFAdd %f32_id %f32_id_0 %843
+        %844 = OpBitcast %f32_id %724
+        %845 = OpBitcast %f32_id %820
+        %178 = OpFMul %f32_id %844 %845
+        %846 = OpBitcast %f32_id %772
+        %179 = OpFMul %f32_id %178 %846
+        %847 = OpSelect %f32_id %842 %f32_id_1 %f32_id_0
+        %848 = OpFOrdGreaterThanEqual %bool_id %f32_id_1 %176
+        %849 = OpSelect %f32_id %848 %f32_id_1 %f32_id_0
+        %850 = OpFOrdGreaterThanEqual %bool_id %f32_id_1 %177
+        %180 = OpFMul %f32_id %847 %849
+        %851 = OpSelect %f32_id %850 %f32_id_1 %f32_id_0
+        %852 = OpBitcast %f32_id %826
+        %853 = OpFOrdGreaterThanEqual %bool_id %852 %f32_id_1
+        %181 = OpFMul %f32_id %180 %851
+        %854 = OpBitcast %f32_id %584
+        %855 = OpExtInst %f32_id %1 FMin %854 %179
+        %182 = OpFMul %f32_id %181 %855
+        %856 = OpSelect %f32_id %853 %f32_id_1 %f32_id_0
+        %183 = OpFAdd %f32_id %856 %125
+        %184 = OpFMul %f32_id %119 %f32_id_2
+        %185 = OpFMul %f32_id %122 %f32_id_2
+        %186 = OpFMul %f32_id %124 %f32_id_2
+        %857 = OpExtInst %f32_id %1 FAbs %119
+        %858 = OpExtInst %f32_id %1 FAbs %122
+        %859 = OpExtInst %f32_id %1 FAbs %124
+        %860 = OpFOrdGreaterThanEqual %bool_id %859 %857
+        %861 = OpFOrdGreaterThanEqual %bool_id %859 %858
+        %862 = OpLogicalAnd %bool_id %860 %861
+        %863 = OpFOrdGreaterThanEqual %bool_id %858 %857
+        %864 = OpSelect %f32_id %863 %185 %184
+        %865 = OpSelect %f32_id %862 %186 %864
+        %866 = OpExtInst %f32_id %1 FAbs %865
+        %867 = OpFDiv %f32_id %f32_id_1 %866
+        %868 = OpFOrdLessThan %bool_id %119 %f32_id_0
+        %869 = OpFOrdLessThan %bool_id %124 %f32_id_0
+        %870 = OpFNegate %f32_id %124
+        %871 = OpSelect %f32_id %868 %124 %870
+        %872 = OpFNegate %f32_id %119
+        %873 = OpSelect %f32_id %869 %872 %119
+        %874 = OpExtInst %f32_id %1 FAbs %119
+        %875 = OpExtInst %f32_id %1 FAbs %122
+        %876 = OpExtInst %f32_id %1 FAbs %124
+        %877 = OpFOrdGreaterThanEqual %bool_id %876 %874
+        %878 = OpFOrdGreaterThanEqual %bool_id %876 %875
+        %879 = OpLogicalAnd %bool_id %877 %878
+        %880 = OpFOrdGreaterThanEqual %bool_id %875 %874
+        %881 = OpSelect %f32_id %880 %119 %871
+        %882 = OpSelect %f32_id %879 %873 %881
+        %187 = OpExtInst %f32_id %1 Fma %882 %867 %f32_id_1_5
+        %883 = OpBitcast %f32_id %584
+        %188 = OpFSub %f32_id %883 %855
+        %884 = OpBitcast %u32_id %188
+        %885 = OpFOrdLessThan %bool_id %122 %f32_id_0
+        %886 = OpFNegate %f32_id %122
+        %887 = OpFNegate %f32_id %124
+        %888 = OpSelect %f32_id %885 %887 %124
+        %889 = OpExtInst %f32_id %1 FAbs %119
+        %890 = OpExtInst %f32_id %1 FAbs %122
+        %891 = OpExtInst %f32_id %1 FAbs %124
+        %892 = OpFOrdGreaterThanEqual %bool_id %891 %889
+        %893 = OpFOrdGreaterThanEqual %bool_id %891 %890
+        %894 = OpLogicalAnd %bool_id %892 %893
+        %895 = OpFOrdGreaterThanEqual %bool_id %890 %889
+        %896 = OpSelect %f32_id %895 %888 %886
+        %897 = OpSelect %f32_id %894 %886 %896
+        %189 = OpExtInst %f32_id %1 Fma %897 %867 %f32_id_1_5
+        %898 = OpFOrdLessThan %bool_id %119 %f32_id_0
+        %899 = OpFOrdLessThan %bool_id %122 %f32_id_0
+        %900 = OpFOrdLessThan %bool_id %124 %f32_id_0
+        %901 = OpSelect %f32_id %898 %f32_id_1 %f32_id_0
+        %902 = OpSelect %f32_id %899 %f32_id_3 %f32_id_2
+        %903 = OpSelect %f32_id %900 %f32_id_5 %f32_id_4
+        %904 = OpExtInst %f32_id %1 FAbs %119
+        %905 = OpExtInst %f32_id %1 FAbs %122
+        %906 = OpExtInst %f32_id %1 FAbs %124
+        %907 = OpFOrdGreaterThanEqual %bool_id %906 %904
+        %908 = OpFOrdGreaterThanEqual %bool_id %906 %905
+        %909 = OpLogicalAnd %bool_id %907 %908
+        %910 = OpFOrdGreaterThanEqual %bool_id %905 %904
+        %911 = OpSelect %f32_id %910 %902 %901
+        %912 = OpSelect %f32_id %909 %903 %911
+        %913 = OpBitcast %f32_id %826
+        %190 = OpExtInst %f32_id %1 Fma %913 %f32_id_8 %912
+        %191 = OpFSub %f32_id %187 %f32_id_1
+        %192 = OpFSub %f32_id %189 %f32_id_1
+        %914 = OpCompositeConstruct %f32vec3_id %191 %192 %190
+        %915 = OpLoad %273 %cs_img24
+        %916 = OpLoad %278 %cs_sampsgpr_96
+        %917 = OpSampledImage %275 %915 %916
+        %918 = OpImageSampleExplicitLod %f32vec4_id %917 %914 Lod %183
+        %919 = OpCompositeExtract %f32_id %918 0
+        %920 = OpCompositeExtract %f32_id %918 1
+        %921 = OpCompositeExtract %f32_id %918 2
+        %193 = OpFMul %f32_id %107 %f32_id_2
+        %194 = OpFMul %f32_id %115 %f32_id_2
+        %195 = OpFMul %f32_id %113 %f32_id_2
+        %922 = OpExtInst %f32_id %1 FAbs %107
+        %923 = OpExtInst %f32_id %1 FAbs %115
+        %924 = OpExtInst %f32_id %1 FAbs %113
+        %925 = OpFOrdGreaterThanEqual %bool_id %924 %922
+        %926 = OpFOrdGreaterThanEqual %bool_id %924 %923
+        %927 = OpLogicalAnd %bool_id %925 %926
+        %928 = OpFOrdGreaterThanEqual %bool_id %923 %922
+        %929 = OpSelect %f32_id %928 %194 %193
+        %930 = OpSelect %f32_id %927 %195 %929
+        %931 = OpExtInst %f32_id %1 FAbs %930
+        %932 = OpFDiv %f32_id %f32_id_1 %931
+        %933 = OpFOrdLessThan %bool_id %107 %f32_id_0
+        %934 = OpFOrdLessThan %bool_id %113 %f32_id_0
+        %935 = OpFNegate %f32_id %113
+        %936 = OpSelect %f32_id %933 %113 %935
+        %937 = OpFNegate %f32_id %107
+        %938 = OpSelect %f32_id %934 %937 %107
+        %939 = OpExtInst %f32_id %1 FAbs %107
+        %940 = OpExtInst %f32_id %1 FAbs %115
+        %941 = OpExtInst %f32_id %1 FAbs %113
+        %942 = OpFOrdGreaterThanEqual %bool_id %941 %939
+        %943 = OpFOrdGreaterThanEqual %bool_id %941 %940
+        %944 = OpLogicalAnd %bool_id %942 %943
+        %945 = OpFOrdGreaterThanEqual %bool_id %940 %939
+        %946 = OpSelect %f32_id %945 %107 %936
+        %947 = OpSelect %f32_id %944 %938 %946
+        %196 = OpExtInst %f32_id %1 Fma %947 %932 %f32_id_1_5
+        %197 = OpExtInst %f32_id %1 Fma %839 %932 %f32_id_1_5
+        %948 = OpFOrdLessThan %bool_id %107 %f32_id_0
+        %949 = OpFOrdLessThan %bool_id %115 %f32_id_0
+        %950 = OpFOrdLessThan %bool_id %113 %f32_id_0
+        %951 = OpSelect %f32_id %948 %f32_id_1 %f32_id_0
+        %952 = OpSelect %f32_id %949 %f32_id_3 %f32_id_2
+        %953 = OpSelect %f32_id %950 %f32_id_5 %f32_id_4
+        %954 = OpExtInst %f32_id %1 FAbs %107
+        %955 = OpExtInst %f32_id %1 FAbs %115
+        %956 = OpExtInst %f32_id %1 FAbs %113
+        %957 = OpFOrdGreaterThanEqual %bool_id %956 %954
+        %958 = OpFOrdGreaterThanEqual %bool_id %956 %955
+        %959 = OpLogicalAnd %bool_id %957 %958
+        %960 = OpFOrdGreaterThanEqual %bool_id %955 %954
+        %961 = OpSelect %f32_id %960 %952 %951
+        %962 = OpSelect %f32_id %959 %953 %961
+        %963 = OpBitcast %f32_id %826
+        %198 = OpExtInst %f32_id %1 Fma %963 %f32_id_8 %962
+        %199 = OpFSub %f32_id %196 %f32_id_1
+        %200 = OpFSub %f32_id %197 %f32_id_1
+        %964 = OpCompositeConstruct %f32vec3_id %199 %200 %198
+        %965 = OpLoad %273 %cs_img32
+        %966 = OpLoad %278 %cs_sampsgpr_0
+        %967 = OpSampledImage %275 %965 %966
+        %968 = OpImageSampleExplicitLod %f32vec4_id %967 %964 Lod %f32_id_0
+        %969 = OpCompositeExtract %f32_id %968 0
+        %970 = OpCompositeExtract %f32_id %968 1
+        %971 = OpCompositeExtract %f32_id %968 2
+        %972 = OpBitcast %f32_id %574
+        %201 = OpExtInst %f32_id %1 Fma %182 %919 %972
+        %973 = OpBitcast %u32_id %201
+        %974 = OpBitcast %f32_id %576
+        %202 = OpExtInst %f32_id %1 Fma %182 %920 %974
+        %975 = OpBitcast %u32_id %202
+        %976 = OpBitcast %f32_id %578
+        %203 = OpExtInst %f32_id %1 Fma %182 %921 %976
+        %977 = OpBitcast %u32_id %203
+        %978 = OpBitcast %f32_id %580
+        %204 = OpExtInst %f32_id %1 Fma %182 %969 %978
+        %979 = OpBitcast %u32_id %204
+        %980 = OpBitcast %f32_id %571
+        %205 = OpExtInst %f32_id %1 Fma %182 %970 %980
+        %981 = OpBitcast %u32_id %205
+        %982 = OpBitcast %f32_id %582
+        %206 = OpExtInst %f32_id %1 Fma %182 %971 %982
+        %983 = OpBitcast %u32_id %206
+               OpBranch %616
+        %616 = OpLabel
+        %572 = OpPhi %u32_id %981 %808 %571 %592
+        %575 = OpPhi %u32_id %973 %808 %574 %592
+        %577 = OpPhi %u32_id %975 %808 %576 %592
+        %579 = OpPhi %u32_id %977 %808 %578 %592
+        %581 = OpPhi %u32_id %979 %808 %580 %592
+        %583 = OpPhi %u32_id %983 %808 %582 %592
+        %585 = OpPhi %u32_id %884 %808 %584 %592
+        %587 = OpIAdd %u32_id %586 %u32_id_1
+               OpBranch %573
+        %573 = OpLabel
+               OpBranchConditional %true %570 %588
+        %588 = OpLabel
+        %984 = OpPhi %u32_id %578 %589 %579 %573
+        %985 = OpPhi %u32_id %576 %589 %577 %573
+        %986 = OpPhi %u32_id %574 %589 %575 %573
+        %987 = OpPhi %u32_id %582 %589 %583 %573
+        %988 = OpPhi %u32_id %571 %589 %572 %573
+        %989 = OpPhi %u32_id %580 %589 %581 %573
+        %990 = OpPhi %u32_id %584 %589 %585 %573
+        %991 = OpFOrdLessThan %bool_id %122 %f32_id_0
+        %992 = OpFNegate %f32_id %122
+        %993 = OpFNegate %f32_id %124
+        %994 = OpSelect %f32_id %991 %993 %124
+        %995 = OpExtInst %f32_id %1 FAbs %119
+        %996 = OpExtInst %f32_id %1 FAbs %122
+        %997 = OpExtInst %f32_id %1 FAbs %124
+        %998 = OpFOrdGreaterThanEqual %bool_id %997 %995
+        %999 = OpFOrdGreaterThanEqual %bool_id %997 %996
+       %1000 = OpLogicalAnd %bool_id %998 %999
+       %1001 = OpFOrdGreaterThanEqual %bool_id %996 %995
+       %1002 = OpSelect %f32_id %1001 %994 %992
+       %1003 = OpSelect %f32_id %1000 %992 %1002
+       %1004 = OpFNegate %f32_id %106
+        %207 = OpFMul %f32_id %1004 %107
+       %1005 = OpCompositeConstruct %u32vec2_id %426 %427
+       %1006 = OpLoad %276 %cs_img124
+       %1007 = OpImageRead %f32vec4_id %1006 %1005 None
+       %1008 = OpVectorShuffle %f32vec4_id %354 %1007 4 5 0 1
+       %1009 = OpCompositeExtract %f32_id %1008 0
+       %1010 = OpCompositeExtract %f32_id %1008 1
+       %1011 = OpFNegate %f32_id %110
+        %208 = OpExtInst %f32_id %1 Fma %115 %1011 %207
+       %1012 = OpFNegate %f32_id %112
+        %209 = OpExtInst %f32_id %1 Fma %113 %1012 %208
+       %1013 = OpExtInst %f32_id %1 FClamp %209 %f32_id_0 %f32_id_1
+        %210 = OpFSub %f32_id %f32_id_1 %1013
+       %1014 = OpExtInst %f32_id %1 FAbs %210
+       %1015 = OpExtInst %f32_id %1 Log2 %1014
+        %211 = OpFMul %f32_id %f32_id_5 %1015
+       %1016 = OpExtInst %f32_id %1 FMax %f32_id_0 %126
+       %1017 = OpExtInst %f32_id %1 FClamp %1016 %f32_id_0 %f32_id_1
+       %1018 = OpExtInst %f32_id %1 Exp2 %211
+        %212 = OpFSub %f32_id %1017 %479
+        %213 = OpExtInst %f32_id %1 Fma %f32_id_n5 %557 %f32_id_6
+        %214 = OpExtInst %f32_id %1 Fma %1018 %212 %479
+       %1019 = OpFDiv %f32_id %f32_id_1 %213
+        %215 = OpFMul %f32_id %1019 %214
+       %1020 = OpFOrdLessThan %bool_id %115 %f32_id_0
+       %1021 = OpFNegate %f32_id %115
+       %1022 = OpFNegate %f32_id %113
+       %1023 = OpSelect %f32_id %1020 %1022 %113
+       %1024 = OpExtInst %f32_id %1 FAbs %107
+       %1025 = OpExtInst %f32_id %1 FAbs %115
+       %1026 = OpExtInst %f32_id %1 FAbs %113
+       %1027 = OpFOrdGreaterThanEqual %bool_id %1026 %1024
+       %1028 = OpFOrdGreaterThanEqual %bool_id %1026 %1025
+       %1029 = OpLogicalAnd %bool_id %1027 %1028
+       %1030 = OpFOrdGreaterThanEqual %bool_id %1025 %1024
+       %1031 = OpSelect %f32_id %1030 %1023 %1021
+       %1032 = OpSelect %f32_id %1029 %1021 %1031
+       %1033 = OpExtInst %f32_id %1 FMax %f32_id_0 %479
+       %1034 = OpExtInst %f32_id %1 FClamp %1033 %f32_id_0 %f32_id_1
+        %216 = OpFSub %f32_id %f32_id_1 %1034
+        %217 = OpFMul %f32_id %107 %f32_id_2
+        %218 = OpFMul %f32_id %115 %f32_id_2
+        %219 = OpFMul %f32_id %113 %f32_id_2
+       %1035 = OpExtInst %f32_id %1 FAbs %107
+       %1036 = OpExtInst %f32_id %1 FAbs %115
+       %1037 = OpExtInst %f32_id %1 FAbs %113
+       %1038 = OpFOrdGreaterThanEqual %bool_id %1037 %1035
+       %1039 = OpFOrdGreaterThanEqual %bool_id %1037 %1036
+       %1040 = OpLogicalAnd %bool_id %1038 %1039
+       %1041 = OpFOrdGreaterThanEqual %bool_id %1036 %1035
+       %1042 = OpSelect %f32_id %1041 %218 %217
+       %1043 = OpSelect %f32_id %1040 %219 %1042
+       %1044 = OpExtInst %f32_id %1 FAbs %1043
+       %1045 = OpFDiv %f32_id %f32_id_1 %1044
+       %1046 = OpFOrdLessThan %bool_id %107 %f32_id_0
+       %1047 = OpFOrdLessThan %bool_id %113 %f32_id_0
+       %1048 = OpFNegate %f32_id %113
+       %1049 = OpSelect %f32_id %1046 %113 %1048
+       %1050 = OpFNegate %f32_id %107
+       %1051 = OpSelect %f32_id %1047 %1050 %107
+       %1052 = OpExtInst %f32_id %1 FAbs %107
+       %1053 = OpExtInst %f32_id %1 FAbs %115
+       %1054 = OpExtInst %f32_id %1 FAbs %113
+       %1055 = OpFOrdGreaterThanEqual %bool_id %1054 %1052
+       %1056 = OpFOrdGreaterThanEqual %bool_id %1054 %1053
+       %1057 = OpLogicalAnd %bool_id %1055 %1056
+       %1058 = OpFOrdGreaterThanEqual %bool_id %1053 %1052
+       %1059 = OpSelect %f32_id %1058 %107 %1049
+       %1060 = OpSelect %f32_id %1057 %1051 %1059
+        %220 = OpExtInst %f32_id %1 Fma %1060 %1045 %f32_id_1_5
+        %221 = OpExtInst %f32_id %1 Fma %1032 %1045 %f32_id_1_5
+       %1061 = OpFOrdLessThan %bool_id %107 %f32_id_0
+       %1062 = OpFOrdLessThan %bool_id %115 %f32_id_0
+       %1063 = OpFOrdLessThan %bool_id %113 %f32_id_0
+       %1064 = OpSelect %f32_id %1061 %f32_id_1 %f32_id_0
+       %1065 = OpSelect %f32_id %1062 %f32_id_3 %f32_id_2
+       %1066 = OpSelect %f32_id %1063 %f32_id_5 %f32_id_4
+       %1067 = OpExtInst %f32_id %1 FAbs %107
+       %1068 = OpExtInst %f32_id %1 FAbs %115
+       %1069 = OpExtInst %f32_id %1 FAbs %113
+       %1070 = OpFOrdGreaterThanEqual %bool_id %1069 %1067
+       %1071 = OpFOrdGreaterThanEqual %bool_id %1069 %1068
+       %1072 = OpLogicalAnd %bool_id %1070 %1071
+       %1073 = OpFOrdGreaterThanEqual %bool_id %1068 %1067
+       %1074 = OpSelect %f32_id %1073 %1065 %1064
+       %1075 = OpSelect %f32_id %1072 %1066 %1074
+        %222 = OpFSub %f32_id %220 %f32_id_1
+        %223 = OpFSub %f32_id %221 %f32_id_1
+       %1076 = OpCompositeConstruct %f32vec3_id %222 %223 %1075
+       %1077 = OpLoad %273 %cs_img40
+       %1078 = OpLoad %278 %cs_sampsgpr_0
+       %1079 = OpSampledImage %275 %1077 %1078
+       %1080 = OpImageSampleExplicitLod %f32vec4_id %1079 %1076 Lod %f32_id_0
+       %1081 = OpCompositeExtract %f32_id %1080 0
+       %1082 = OpCompositeExtract %f32_id %1080 1
+       %1083 = OpCompositeExtract %f32_id %1080 2
+        %224 = OpFMul %f32_id %119 %f32_id_2
+        %225 = OpFMul %f32_id %122 %f32_id_2
+        %226 = OpFMul %f32_id %124 %f32_id_2
+       %1084 = OpExtInst %f32_id %1 FAbs %119
+       %1085 = OpExtInst %f32_id %1 FAbs %122
+       %1086 = OpExtInst %f32_id %1 FAbs %124
+       %1087 = OpFOrdGreaterThanEqual %bool_id %1086 %1084
+       %1088 = OpFOrdGreaterThanEqual %bool_id %1086 %1085
+       %1089 = OpLogicalAnd %bool_id %1087 %1088
+       %1090 = OpFOrdGreaterThanEqual %bool_id %1085 %1084
+       %1091 = OpSelect %f32_id %1090 %225 %224
+       %1092 = OpSelect %f32_id %1089 %226 %1091
+       %1093 = OpExtInst %f32_id %1 FAbs %1092
+       %1094 = OpFDiv %f32_id %f32_id_1 %1093
+       %1095 = OpFOrdLessThan %bool_id %119 %f32_id_0
+       %1096 = OpFOrdLessThan %bool_id %124 %f32_id_0
+       %1097 = OpFNegate %f32_id %124
+       %1098 = OpSelect %f32_id %1095 %124 %1097
+       %1099 = OpFNegate %f32_id %119
+       %1100 = OpSelect %f32_id %1096 %1099 %119
+       %1101 = OpExtInst %f32_id %1 FAbs %119
+       %1102 = OpExtInst %f32_id %1 FAbs %122
+       %1103 = OpExtInst %f32_id %1 FAbs %124
+       %1104 = OpFOrdGreaterThanEqual %bool_id %1103 %1101
+       %1105 = OpFOrdGreaterThanEqual %bool_id %1103 %1102
+       %1106 = OpLogicalAnd %bool_id %1104 %1105
+       %1107 = OpFOrdGreaterThanEqual %bool_id %1102 %1101
+       %1108 = OpSelect %f32_id %1107 %119 %1098
+       %1109 = OpSelect %f32_id %1106 %1100 %1108
+       %1110 = OpCompositeConstruct %f32vec2_id %71 %75
+       %1111 = OpLoad %270 %cs_img56
+       %1112 = OpLoad %278 %cs_sampsgpr_100
+       %1113 = OpSampledImage %272 %1111 %1112
+       %1114 = OpImageSampleExplicitLod %f32vec4_id %1113 %1110 Lod %f32_id_0
+       %1115 = OpCompositeExtract %f32_id %1114 0
+       %1116 = OpCompositeExtract %f32_id %1114 1
+       %1117 = OpCompositeExtract %f32_id %1114 2
+       %1118 = OpCompositeExtract %f32_id %1114 3
+        %227 = OpExtInst %f32_id %1 Fma %1109 %1094 %f32_id_1_5
+        %228 = OpExtInst %f32_id %1 Fma %1003 %1094 %f32_id_1_5
+       %1119 = OpFOrdLessThan %bool_id %119 %f32_id_0
+       %1120 = OpFOrdLessThan %bool_id %122 %f32_id_0
+       %1121 = OpFOrdLessThan %bool_id %124 %f32_id_0
+       %1122 = OpSelect %f32_id %1119 %f32_id_1 %f32_id_0
+       %1123 = OpSelect %f32_id %1120 %f32_id_3 %f32_id_2
+       %1124 = OpSelect %f32_id %1121 %f32_id_5 %f32_id_4
+       %1125 = OpExtInst %f32_id %1 FAbs %119
+       %1126 = OpExtInst %f32_id %1 FAbs %122
+       %1127 = OpExtInst %f32_id %1 FAbs %124
+       %1128 = OpFOrdGreaterThanEqual %bool_id %1127 %1125
+       %1129 = OpFOrdGreaterThanEqual %bool_id %1127 %1126
+       %1130 = OpLogicalAnd %bool_id %1128 %1129
+       %1131 = OpFOrdGreaterThanEqual %bool_id %1126 %1125
+       %1132 = OpSelect %f32_id %1131 %1123 %1122
+       %1133 = OpSelect %f32_id %1130 %1124 %1132
+        %229 = OpFSub %f32_id %227 %f32_id_1
+        %230 = OpFSub %f32_id %228 %f32_id_1
+       %1134 = OpCompositeConstruct %f32vec3_id %229 %230 %1133
+       %1135 = OpLoad %273 %cs_img48
+       %1136 = OpLoad %278 %cs_sampsgpr_96
+       %1137 = OpSampledImage %275 %1135 %1136
+       %1138 = OpImageSampleExplicitLod %f32vec4_id %1137 %1134 Lod %125
+       %1139 = OpCompositeExtract %f32_id %1138 0
+       %1140 = OpCompositeExtract %f32_id %1138 1
+       %1141 = OpCompositeExtract %f32_id %1138 2
+       %1142 = OpCompositeConstruct %f32vec2_id %71 %75
+       %1143 = OpLoad %270 %cs_img64
+       %1144 = OpLoad %278 %cs_sampsgpr_100
+       %1145 = OpSampledImage %272 %1143 %1144
+       %1146 = OpImageSampleExplicitLod %f32vec4_id %1145 %1142 Lod %f32_id_0
+       %1147 = OpCompositeExtract %f32_id %1146 0
+       %1148 = OpCompositeExtract %f32_id %1146 1
+       %1149 = OpCompositeExtract %f32_id %1146 2
+       %1150 = OpIAdd %u32_id %u32_id_16 %buf4_dword_off
+       %1151 = OpAccessChain %_ptr_StorageBuffer_u32_id %ssbo_5 %u32_id_0 %1150
+       %1152 = OpLoad %u32_id %1151
+        %231 = OpFSub %f32_id %f32_id_1 %1009
+        %232 = OpFMul %f32_id %1009 %215
+        %233 = OpFMul %f32_id %231 %215
+       %1153 = OpCompositeConstruct %f32vec4_id %232 %1010 %f32_id_0 %f32_id_0
+       %1154 = OpCompositeConstruct %u32vec2_id %426 %427
+       %1155 = OpVectorShuffle %f32vec4_id %354 %1153 4 5 0 0
+       %1156 = OpLoad %276 %cs_img124
+               OpImageWrite %1156 %1154 %1155 None
+       %1157 = OpBitcast %f32_id %990
+       %1158 = OpBitcast %f32_id %989
+        %234 = OpExtInst %f32_id %1 Fma %1157 %1081 %1158
+       %1159 = OpBitcast %f32_id %990
+       %1160 = OpBitcast %f32_id %988
+        %235 = OpExtInst %f32_id %1 Fma %1082 %1159 %1160
+       %1161 = OpBitcast %f32_id %990
+       %1162 = OpBitcast %f32_id %987
+        %236 = OpExtInst %f32_id %1 Fma %1161 %1083 %1162
+        %237 = OpFMul %f32_id %1115 %216
+        %238 = OpFMul %f32_id %216 %1116
+        %239 = OpFMul %f32_id %216 %1117
+        %240 = OpFMul %f32_id %237 %234
+       %1163 = OpBitcast %f32_id %990
+       %1164 = OpBitcast %f32_id %986
+        %241 = OpExtInst %f32_id %1 Fma %1163 %1139 %1164
+        %242 = OpFMul %f32_id %1118 %1118
+        %243 = OpFMul %f32_id %238 %235
+       %1165 = OpBitcast %f32_id %990
+       %1166 = OpBitcast %f32_id %985
+        %244 = OpExtInst %f32_id %1 Fma %1165 %1140 %1166
+        %245 = OpFMul %f32_id %239 %236
+       %1167 = OpBitcast %f32_id %990
+       %1168 = OpBitcast %f32_id %984
+        %246 = OpExtInst %f32_id %1 Fma %1167 %1141 %1168
+        %247 = OpExtInst %f32_id %1 Fma %241 %233 %240
+       %1169 = OpBitcast %f32_id %1152
+        %248 = OpFMul %f32_id %1169 %242
+        %249 = OpExtInst %f32_id %1 Fma %244 %233 %243
+        %250 = OpExtInst %f32_id %1 Fma %246 %233 %245
+        %251 = OpExtInst %f32_id %1 Fma %247 %248 %1147
+        %252 = OpExtInst %f32_id %1 Fma %249 %248 %1148
+        %253 = OpExtInst %f32_id %1 Fma %250 %248 %1149
+       %1170 = OpExtInst %f32_id %1 FMax %251 %f32_id_0
+       %1171 = OpExtInst %f32_id %1 FMax %252 %f32_id_0
+       %1172 = OpExtInst %f32_id %1 FMax %253 %f32_id_0
+       %1173 = OpFMul %f32_id %1170 %f32_id_0_298900008
+       %1174 = OpFMul %f32_id %1171 %f32_id_0_587000012
+       %1175 = OpFMul %f32_id %1172 %f32_id_0_114100002
+       %1176 = OpFAdd %f32_id %1173 %1174
+       %1177 = OpFAdd %f32_id %1176 %1175
+       %1178 = OpExtInst %f32_id %1 FMax %1177 %f32_id_9_99999975en06
+       %1179 = OpExtInst %f32_id %1 Pow %1178 %f32_id_0_555559993
+       %1180 = OpFDiv %f32_id %1179 %1178
+       %1181 = OpFMul %f32_id %1170 %1180
+       %1182 = OpFMul %f32_id %1171 %1180
+       %1183 = OpFMul %f32_id %1172 %1180
+       %1184 = OpCompositeConstruct %f32vec4_id %1181 %1182 %1183 %f32_id_1
+       %1185 = OpCompositeConstruct %u32vec2_id %426 %427
+       %1186 = OpVectorShuffle %f32vec4_id %354 %1184 6 5 4 0
+       %1187 = OpLoad %276 %cs_img116
+               OpImageWrite %1187 %1185 %1186 None
+               OpBranch %391
+        %391 = OpLabel
+               OpBranch %1188
+       %1188 = OpLabel
+               OpReturn
+               OpFunctionEnd

@@ -52,3 +52,4 @@ file directly for context on a specific probe.
 | [phase-22plus-tonemap-compute-patches.md](phase-22plus-tonemap-compute-patches.md) | Tonemap SPIR-V patches: ×10 boost makes race playable; bright→dim→bright pattern confirmed |
 | [phase-23-cpu-exposure-intercept.md](phase-23-cpu-exposure-intercept.md) | CPU-side exposure intercept: scripted fade curve captured; cross-track threshold problem |
 | [phase-24-dim-upstream-of-tonemap.md](phase-24-dim-upstream-of-tonemap.md) | Dim is upstream of tonemap; atmospheric/fog extinction or pre-tonemap HDR multiply suspected |
+| [phase-25-frameorder-trace.md](phase-25-frameorder-trace.md) | Frame-order trace maps the pre-tonemap chain; Suspect B `0x00000663dc6eb328` (progressive 256→2560→10240) is the volumetric-fog signature and top target |
