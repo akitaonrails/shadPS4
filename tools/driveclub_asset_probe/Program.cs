@@ -39,12 +39,19 @@ var interestingNameTerms = new[]
 
 var interestingSourceTerms = new[]
 {
+    "globaldata.lvl",
     "india_posteffects.lvl",
     "prerace_cams.lvl"
 };
 
 bool IsInteresting(ResourceInfo info)
 {
+    if (info.ResourceId.Type == ResourceTypeId.RTUID_ANIMATIONLIB &&
+        info.SourceAssetPaths.Any(path => path.Contains("globaldata.lvl", StringComparison.OrdinalIgnoreCase)))
+    {
+        return true;
+    }
+
     foreach (var name in info.Names)
     {
         var lower = name.ToLowerInvariant();
@@ -66,8 +73,39 @@ bool IsInteresting(ResourceInfo info)
     return false;
 }
 
-var matches = pack.ResourceInfos.Values
+var seedInfos = pack.ResourceInfos.Values
     .Where(IsInteresting)
+    .OrderBy(v => v.ResourceId.Type)
+    .ThenBy(v => v.Names.FirstOrDefault() ?? string.Empty)
+    .ToList();
+
+var matchSet = new Dictionary<ResourceIdentifier, ResourceInfo>();
+var queue = new Queue<ResourceInfo>(seedInfos);
+while (queue.Count > 0)
+{
+    var current = queue.Dequeue();
+    if (!matchSet.TryAdd(current.ResourceId, current))
+    {
+        continue;
+    }
+
+    foreach (var dep in current.Dependancies)
+    {
+        if (!pack.ResourceInfos.TryGetValue(dep, out var depInfo))
+        {
+            continue;
+        }
+
+        if (dep.Type == ResourceTypeId.RTUID_LEVEL_DATA ||
+            dep.Type == ResourceTypeId.RTUID_ANIMATIONLIB ||
+            dep.Type == ResourceTypeId.RTUID_ACTOR_DATA)
+        {
+            queue.Enqueue(depInfo);
+        }
+    }
+}
+
+var matches = matchSet.Values
     .OrderBy(v => v.ResourceId.Type)
     .ThenBy(v => v.Names.FirstOrDefault() ?? string.Empty)
     .ToList();

@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "common/string_util.h"
 #include "common/thread.h"
@@ -27,6 +28,64 @@
 #endif
 
 namespace Core {
+
+namespace {
+
+struct DriveclubVtableProbe {
+    const char* name;
+    u64 vtable_va;
+};
+
+constexpr std::array<DriveclubVtableProbe, 4> kDriveclubVtableProbes{{
+    {"FreeplayEventDetails?", 0x15c9610},
+    {"FreeplayMain", 0x15dcaa0},
+    {"FreeplayGetInCar", 0x15cfd70},
+    {"FreeplayLivery", 0x15dc970},
+}};
+
+constexpr std::array<DriveclubVtableProbe, 4> kDriveclubPreraceCandidateVtableProbes{{
+    {"PreraceCandidate_15d6b80", 0x15d6b80},
+    {"PreraceCandidate_15dc600", 0x15dc600},
+    {"PreraceCandidate_15dce30", 0x15dce30},
+    {"PreraceCandidate_15dd330", 0x15dd330},
+}};
+
+void DumpDriveclubControllerVtables(const Module* module) {
+    if (MemoryPatcher::g_game_serial != "CUSA00003" || module->name != "eboot.bin") {
+        return;
+    }
+
+    const auto base = module->GetBaseAddress();
+    LOG_INFO(Core_Linker, "[dc-vtbl] dumping resolved controller vtables base={:#x}", base);
+
+    for (const auto& probe : kDriveclubVtableProbes) {
+        const auto addr = base + probe.vtable_va;
+        const auto* words = reinterpret_cast<const u64*>(addr);
+        std::array<u64, 12> slots{};
+        std::memcpy(slots.data(), words, sizeof(slots));
+
+        LOG_INFO(Core_Linker,
+                 "[dc-vtbl] {} vtable_va={:#x} slot0={:#x} slot1={:#x} fn0={:#x} fn1={:#x} "
+                 "fn2={:#x} fn3={:#x} fn4={:#x} fn5={:#x} fn6={:#x} fn7={:#x}",
+                 probe.name, probe.vtable_va, slots[0], slots[1], slots[2], slots[3], slots[4],
+                 slots[5], slots[6], slots[7], slots[8], slots[9]);
+    }
+
+    for (const auto& probe : kDriveclubPreraceCandidateVtableProbes) {
+        const auto addr = base + probe.vtable_va;
+        const auto* words = reinterpret_cast<const u64*>(addr);
+        std::array<u64, 12> slots{};
+        std::memcpy(slots.data(), words, sizeof(slots));
+
+        LOG_INFO(Core_Linker,
+                 "[dc-vtbl] {} vtable_va={:#x} slot0={:#x} slot1={:#x} fn0={:#x} fn1={:#x} "
+                 "fn2={:#x} fn3={:#x} fn4={:#x} fn5={:#x} fn6={:#x} fn7={:#x}",
+                 probe.name, probe.vtable_va, slots[0], slots[1], slots[2], slots[3], slots[4],
+                 slots[5], slots[6], slots[7], slots[8], slots[9]);
+    }
+}
+
+} // namespace
 
 static PS4_SYSV_ABI void ProgramExitFunc() {
     LOG_ERROR(Core_Linker, "Exit function called");
@@ -72,6 +131,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
     // Relocate all modules
     for (const auto& m : m_modules) {
         Relocate(m.get());
+        DumpDriveclubControllerVtables(m.get());
     }
 
     // Configure the direct and flexible memory regions.

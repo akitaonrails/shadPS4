@@ -377,6 +377,43 @@ std::pair<Buffer*, u32> BufferCache::ObtainBuffer(VAddr device_addr, u32 size, b
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
     if (!is_written && size <= CACHING_PAGESIZE && !IsRegionGpuModified(device_addr, size) &&
         IsRegionCpuModified(device_addr, size)) {
+        // Phase 30 probe: log the value being uploaded for 1936-byte
+        // UBOs (Driveclub scene-lighting buffer). If the guest memory
+        // holds near-zero / uninitialised values at race-start, the
+        // stream_buffer.Copy is racing the game's CPU write and the
+        // GPU sees stale data. Throttled per-submit. Enable via
+        // SHADPS4_DC_LOG_STREAMCOPY=1.
+        if (size == 1936) {
+            static const bool log_copy = [] {
+                const char* env = std::getenv("SHADPS4_DC_LOG_STREAMCOPY");
+                const bool on = env && env[0] == '1' && env[1] == '\0';
+                if (on) {
+                    LOG_INFO(Render_Vulkan,
+                             "[dc-streamcopy] enabled (SHADPS4_DC_LOG_STREAMCOPY=1)");
+                }
+                return on;
+            }();
+            if (log_copy) {
+                const auto* b = reinterpret_cast<const u8*>(device_addr);
+                const float v38 = *reinterpret_cast<const float*>(b + 0x98);
+                const float v48 = *reinterpret_cast<const float*>(b + 0xc0);
+                const float v50 = *reinterpret_cast<const float*>(b + 0xc8);
+                const float v24 = *reinterpret_cast<const float*>(b + 24 * 4);
+                static std::mutex m;
+                static u64 last_log = 0;
+                static std::atomic<u64> call_count{0};
+                const u64 submit = call_count.fetch_add(1);
+                std::lock_guard l{m};
+                if (submit - last_log >= 60) {
+                    last_log = submit;
+                    LOG_INFO(Render_Vulkan,
+                             "[dc-streamcopy] submit={} addr={:#x} "
+                             "ambient[24]={:.3g} fade[38]={:.3g} "
+                             "fade[48]={:.3g} fade[50]={:.3g}",
+                             submit, device_addr, v24, v38, v48, v50);
+                }
+            }
+        }
         const u64 offset = stream_buffer.Copy(device_addr, size, instance.UniformMinAlignment());
         return {&stream_buffer, offset};
     }

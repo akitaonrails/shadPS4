@@ -65,7 +65,8 @@ for var in SHADPS4_DC_DRAWLOG SHADPS4_DC_UBOLOG SHADPS4_DC_TORTURE \
            SHADPS4_DC_PROBE_TONEMAP \
            SHADPS4_DC_RECORD \
            SHADPS4_DC_CALIBRATE_AT_ARM \
-           SHADPS4_DC_CALIBRATE_FILE; do
+           SHADPS4_DC_CALIBRATE_FILE \
+           SHADPS4_DC_LOG_STREAMCOPY; do
   if [[ -n "${!var:-}" ]]; then
     PROBE_ENV+="${var}=${!var} "
   fi

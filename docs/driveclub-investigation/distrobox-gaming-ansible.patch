@@ -1,0 +1,67 @@
+## Patch: update distrobox-gaming ansible for DriveClub readbacks_mode fix
+
+The `ansible/roles/seed_configs/templates/CUSA00003.json.j2` template
+currently writes `readbacks_mode: 0` (Disabled). The DriveClub v1.28
+investigation concluded that `readbacks_mode: 2` (Precise) is the
+single required change to make the game playable — it closes the
+GPU→CPU auto-exposure feedback loop. See
+`docs/driveclub-investigation/phase-31-readbacks-mode-fix.md` for
+the full writeup.
+
+### Apply from the distrobox-gaming repo root
+
+```sh
+cd ~/Projects/distrobox-gaming
+git apply <<'PATCH'
+diff --git a/ansible/roles/seed_configs/templates/CUSA00003.json.j2 b/ansible/roles/seed_configs/templates/CUSA00003.json.j2
+index 0000000..0000000 100644
+--- a/ansible/roles/seed_configs/templates/CUSA00003.json.j2
++++ b/ansible/roles/seed_configs/templates/CUSA00003.json.j2
+@@ -11,7 +11,11 @@
+     "internal_screen_height": 1080,
+     "patch_shaders": true,
+     "readback_linear_images_enabled": false,
+-    "readbacks_mode": 0,
++    "readbacks_mode": 2,
+     "copy_gpu_buffers": false,
+     "direct_memory_access_enabled": false,
+     "vblank_frequency": 60
+PATCH
+```
+
+Or, if you prefer a one-line edit:
+
+```sh
+sed -i 's/"readbacks_mode": 0,/"readbacks_mode": 2,/' \
+    ~/Projects/distrobox-gaming/ansible/roles/seed_configs/templates/CUSA00003.json.j2
+```
+
+### After applying
+
+Re-seed the live config in the box:
+
+```sh
+cd ~/Projects/distrobox-gaming/ansible
+ansible-playbook reset-configs.yml --tags configs
+```
+
+Or skip ansible and just verify the live file — the cleanup step
+above already set it to `readbacks_mode: 2` directly:
+
+```
+cat /mnt/data/distrobox/gaming/.local/share/shadPS4/custom_configs/CUSA00003.json
+```
+
+### Optional: also add an explanatory comment
+
+Jinja2 `.j2` templates support comments that don't render in output.
+Useful if you want the *why* embedded next to the setting:
+
+```jinja2
+    {# readbacks_mode: 2 (Precise) closes the GPU->CPU auto-exposure
+       feedback loop. Without it the CPU exposure integrator reads
+       stale zeros and DriveClub darkens to black after ~90s of a
+       race. See shadPS4 fork docs/driveclub-investigation/phase-31-*.
+       Known-slow / AMD-unstable upstream — keep it per-game. #}
+    "readbacks_mode": 2,
+```

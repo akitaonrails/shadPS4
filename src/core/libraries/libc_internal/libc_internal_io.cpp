@@ -4,11 +4,16 @@
 #include <cstdarg>
 #include <cstdio>
 #include <map>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 
 #include <common/va_ctx.h>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/kernel.h"
@@ -19,6 +24,32 @@
 #include "printf.h"
 
 namespace Libraries::LibcInternal {
+
+namespace {
+
+bool IsDriveclubInterestingPath(std::string_view path) {
+    return path.contains("/app0/data/leveldata/") || path.contains("/app0/newui/") ||
+           path.contains("/app0/gui/");
+}
+
+void LogDriveclubFopenOnce(std::string_view path, std::string_view mode) {
+    if (MemoryPatcher::g_game_serial != "CUSA00003" || !IsDriveclubInterestingPath(path)) {
+        return;
+    }
+
+    static std::mutex log_mutex;
+    static std::unordered_set<std::string> seen;
+
+    std::string key = fmt::format("{}|{}", path, mode);
+    std::scoped_lock lock{log_mutex};
+    if (!seen.insert(key).second) {
+        return;
+    }
+
+    LOG_INFO(Lib_LibcInternal, "[dc-asset] api=fopen path={} mode={}", path, mode);
+}
+
+} // namespace
 
 s32 PS4_SYSV_ABI internal_snprintf(char* s, u64 n, VA_ARGS) {
     VA_CTX(ctx);
@@ -198,6 +229,7 @@ s32 PS4_SYSV_ABI internal__Fopen(const char* path, u16 mode, bool flag) {
 OrbisFILE* PS4_SYSV_ABI internal_fopen(const char* path, const char* mode) {
     std::scoped_lock lk{g_file_mtx};
     LOG_INFO(Lib_LibcInternal, "called, path {}, mode {}", path, mode);
+    LogDriveclubFopenOnce(path, mode);
     OrbisFILE* file = internal__Fofind();
     OrbisFILE* ret_file = internal__Foprep(path, mode, file, -1, 0, 0);
     if (ret_file == nullptr) {

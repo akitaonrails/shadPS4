@@ -148,6 +148,41 @@ foreach (var info in pack.ResourceInfos.Values)
             scanBytes: 96,
             patched,
             $"{name}.MasterBrightness.curve");
+
+        // 2026-04-22 Iteration 11 — combined multi-scalar patch.
+        //
+        // Run 1 (MasterBrightness alone) moved the floor from 1.6/255 to
+        // 6.5/255 but that's still perceptually black. A second scalar is
+        // compounding the dim. From the 48-byte per-record scan of
+        // india_posteffects.lvl animlib:
+        //
+        //   ManualAutoMix       +30=0.99034  +34=0.13865  (oscillation
+        //                       between all-manual and all-auto)
+        //   AutoTargetLuminance +33=0.38  (low target — crushes dusk scene)
+        //   ManualExposureLog2  +31=5.8, +60=4.5  (positive log2 stops,
+        //                       these are BRIGHTENING keyframes — do not touch)
+        //
+        // Plan: force ManualAutoMix to 1.0 (pure manual) at both of its
+        // animated keyframes, so the manual exposure path wins and the
+        // auto-exposure loop cannot drag the scene down. And bump
+        // AutoTargetLuminance from 0.38 to 1.0 so even if some code path
+        // still consults the auto pipeline, it targets a bright luminance
+        // instead of the dusk-target 0.38.
+        PatchAnimlibFloatValues(
+            raw,
+            "ManualAutoMix",
+            new[] { (0.99034f, 1.0f), (0.13865f, 1.0f) },
+            scanBytes: 48,
+            patched,
+            $"{name}.ManualAutoMix.curve");
+
+        PatchAnimlibFloatValues(
+            raw,
+            "AutoTargetLuminance",
+            new[] { (0.38f, 1.0f) },
+            scanBytes: 48,
+            patched,
+            $"{name}.AutoTargetLuminance.curve");
     }
 
     if (info.ResourceId.Type == ResourceTypeId.RTUID_ANIMATIONLIB &&

@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <map>
+#include <mutex>
 #include <ranges>
+#include <string>
+#include <unordered_set>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "core/file_sys/devices/console_device.h"
@@ -40,6 +44,32 @@
 namespace D = Core::Devices;
 namespace fs = std::filesystem;
 using FactoryDevice = std::function<std::shared_ptr<D::BaseDevice>(u32, const char*, int, u16)>;
+
+namespace {
+
+bool IsDriveclubInterestingPath(std::string_view path) {
+    return path.contains("/app0/data/leveldata/") || path.contains("/app0/newui/") ||
+           path.contains("/app0/gui/");
+}
+
+void LogDriveclubAssetOpenOnce(std::string_view api, std::string_view path, s32 flags) {
+    if (MemoryPatcher::g_game_serial != "CUSA00003" || !IsDriveclubInterestingPath(path)) {
+        return;
+    }
+
+    static std::mutex log_mutex;
+    static std::unordered_set<std::string> seen;
+
+    std::string key = fmt::format("{}|{}|{:#x}", api, path, flags);
+    std::scoped_lock lock{log_mutex};
+    if (!seen.insert(key).second) {
+        return;
+    }
+
+    LOG_INFO(Kernel_Fs, "[dc-asset] api={} path={} flags={:#x}", api, path, flags);
+}
+
+} // namespace
 
 #define GET_DEVICE_FD(fd)                                                                          \
     [](u32, const char*, int, u16) {                                                               \
@@ -76,6 +106,7 @@ namespace Libraries::Kernel {
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
+    LogDriveclubAssetOpenOnce("open", raw_path, flags);
 
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
