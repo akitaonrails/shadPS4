@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/readback_metrics.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -85,6 +86,10 @@ ImageId TextureCache::GetNullImage(const vk::Format format) {
 }
 
 void TextureCache::ProcessDownloadImages() {
+    if (!download_images.empty()) {
+        Common::ReadbackMetrics::Instance().NoteImageDownloadBatch(
+            static_cast<uint32_t>(download_images.size()));
+    }
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id);
     }
@@ -92,6 +97,9 @@ void TextureCache::ProcessDownloadImages() {
 }
 
 void TextureCache::DownloadImageMemory(ImageId image_id) {
+    const auto t_start = Common::ReadbackMetrics::Instance().IsEnabled()
+                             ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
@@ -128,6 +136,10 @@ void TextureCache::DownloadImageMemory(ImageId image_id) {
             Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
                                                       download_size);
         });
+    if (Common::ReadbackMetrics::Instance().IsEnabled()) {
+        Common::ReadbackMetrics::Instance().NoteImageDownload(
+            download_size, std::chrono::steady_clock::now() - t_start);
+    }
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {

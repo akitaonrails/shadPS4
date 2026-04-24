@@ -740,6 +740,8 @@ set(COMMON src/common/logging/classes.h
            src/common/object_pool.h
            src/common/polyfill_thread.h
            src/common/range_lock.h
+           src/common/readback_metrics.cpp
+           src/common/readback_metrics.h
            src/common/rdtsc.cpp
            src/common/rdtsc.h
            src/common/recursive_lock.cpp

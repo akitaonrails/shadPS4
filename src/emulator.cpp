@@ -12,6 +12,7 @@
 
 #include "common/debug.h"
 #include "common/logging/log.h"
+#include "common/readback_metrics.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/ipc/ipc.h"
@@ -94,6 +95,7 @@ s32 ReadCompiledSdkVersion(const std::filesystem::path& file) {
 void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                    std::optional<std::filesystem::path> p_game_folder) {
     Common::SetCurrentThreadName("shadPS4:Main");
+    Common::ReadbackMetrics::Instance().Init();
     if (waitForDebuggerBeforeRun) {
         Debugger::WaitForDebuggerAttach();
     }
@@ -493,6 +495,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     UpdatePlayTime(id);
     Storage::DataBase::Instance().Close();
+    Common::ReadbackMetrics::Instance().Dump();
 
     std::quick_exit(0);
 }

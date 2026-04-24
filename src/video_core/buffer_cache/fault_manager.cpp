@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/div_ceil.h"
+#include "common/readback_metrics.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -78,6 +79,7 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 }
 
 void FaultManager::ProcessFaultBuffer() {
+    Common::ReadbackMetrics::Instance().NoteFaultDispatch();
     if (u64 wait_tick = fault_areas[current_area]) {
         scheduler.Wait(wait_tick);
         scheduler.PopPendingOperations();

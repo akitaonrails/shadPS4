@@ -4,6 +4,7 @@
 #include <algorithm>
 #include "common/alignment.h"
 #include "common/debug.h"
+#include "common/readback_metrics.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -77,11 +78,14 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
+    Common::ReadbackMetrics::Instance().NotePageInvalidate();
     memory_tracker->InvalidateRegion(
         device_addr, size, [this, device_addr, size] { ReadMemory(device_addr, size, true); });
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+    Common::ScopedReadbackTimer timer{
+        [](auto ns) { Common::ReadbackMetrics::Instance().NoteBufferReadMemory(ns); }};
     liverpool->SendCommand<true>([this, device_addr, size, is_write] {
         Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
         DownloadBufferMemory<false>(buffer, device_addr, size, is_write);
@@ -90,6 +94,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
 
 template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write) {
+    const auto t_start = Common::ReadbackMetrics::Instance().IsEnabled()
+                             ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     memory_tracker->ForEachDownloadRange<false>(
@@ -112,6 +119,10 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             gpu_modified_ranges.Subtract(device_addr_out, range_size);
         });
     if (total_size_bytes == 0) {
+        if (Common::ReadbackMetrics::Instance().IsEnabled()) {
+            Common::ReadbackMetrics::Instance().NoteBufferDownload(
+                0, std::chrono::steady_clock::now() - t_start);
+        }
         return;
     }
     const auto [download, offset] = download_buffer.Map(total_size_bytes);
@@ -141,6 +152,10 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
     } else {
         scheduler.Finish();
         write_data();
+    }
+    if (Common::ReadbackMetrics::Instance().IsEnabled()) {
+        Common::ReadbackMetrics::Instance().NoteBufferDownload(
+            total_size_bytes, std::chrono::steady_clock::now() - t_start);
     }
 }
 

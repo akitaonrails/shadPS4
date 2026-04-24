@@ -5,6 +5,7 @@
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/readback_metrics.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -830,6 +831,14 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+    if (Common::ReadbackMetrics::Instance().IsEnabled()) {
+        static thread_local std::chrono::steady_clock::time_point last_present{};
+        const auto now = std::chrono::steady_clock::now();
+        if (last_present.time_since_epoch().count() != 0) {
+            Common::ReadbackMetrics::Instance().NoteFrame(now - last_present);
+        }
+        last_present = now;
+    }
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {

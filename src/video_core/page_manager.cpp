@@ -6,6 +6,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/range_lock.h"
+#include "common/readback_metrics.h"
 #include "common/signal_context.h"
 #include "core/memory.h"
 #include "core/signals.h"
@@ -123,6 +124,8 @@ struct PageManager::Impl {
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
+        Common::ScopedReadbackTimer timer{
+            [](auto ns) { Common::ReadbackMetrics::Instance().NotePageProtect(ns); }};
         bool allow_write = True(perms & Core::MemoryPermission::Write);
         uffdio_writeprotect wp;
         wp.range.start = address;
@@ -200,6 +203,8 @@ struct PageManager::Impl {
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) {
         RENDERER_TRACE;
+        Common::ScopedReadbackTimer timer{
+            [](auto ns) { Common::ReadbackMetrics::Instance().NotePageProtect(ns); }};
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
