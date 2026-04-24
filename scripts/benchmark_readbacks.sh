@@ -48,16 +48,18 @@ esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN=${BIN:-${ROOT}/build-perf/shadps4}
-EBOOT=${EBOOT:-/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/CUSA00003/eboot.bin}
+# SERIAL defaults to DriveClub; override to e.g. CUSA00207 for Bloodborne.
+SERIAL=${SERIAL:-CUSA00003}
+EBOOT=${EBOOT:-/mnt/terachad/Emulators/EmuDeck/roms_rare/ps4/${SERIAL}/eboot.bin}
 CFG_DIR=${CFG_DIR:-/mnt/data/distrobox/gaming/.local/share/shadPS4/custom_configs}
 BENCH_DIR=${BENCH_DIR:-${ROOT}/bench}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 
 OUT_DIR="${BENCH_DIR}/${RUN_ID}"
-CSV_PATH="${OUT_DIR}/${LABEL}-${MODE_NAME}.csv"
-LOG_PATH="${OUT_DIR}/${LABEL}-${MODE_NAME}.log"
-CFG_PATH="${CFG_DIR}/CUSA00003.json"
-CFG_BACKUP="${CFG_DIR}/CUSA00003.json.bench-backup"
+CSV_PATH="${OUT_DIR}/${SERIAL}-${LABEL}-${MODE_NAME}.csv"
+LOG_PATH="${OUT_DIR}/${SERIAL}-${LABEL}-${MODE_NAME}.log"
+CFG_PATH="${CFG_DIR}/${SERIAL}.json"
+CFG_BACKUP="${CFG_DIR}/${SERIAL}.json.bench-backup"
 
 [[ -x "$BIN" ]] || { echo "binary not executable: $BIN" >&2; exit 2; }
 [[ -f "$EBOOT" ]] || { echo "eboot missing: $EBOOT" >&2; exit 2; }
@@ -97,32 +99,62 @@ export SDL_JOYSTICK_HIDAPI_PS5=1
 export SDL_JOYSTICK_HIDAPI_XBOX=1
 export SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1
 
-# Use exec+& so we keep control of the pid. distrobox-enter forwards
-# env vars transparently.
+# Abort if a previous emulator is still live inside the box. The
+# benchmark has to own the only running instance or the CSV gets
+# scribbled by an unrelated process.
+if distrobox-enter gaming -- pgrep -x shadps4 >/dev/null 2>&1; then
+  echo "   ERROR: shadps4 already running inside the container. Aborting." >&2
+  distrobox-enter gaming -- pgrep -x shadps4 >&2
+  exit 3
+fi
+
+# Launch. distrobox-enter wraps docker exec, which runs in the host
+# but launches the binary inside the container's PID namespace. We
+# cannot reliably signal the child binary from the host side, so
+# all kill operations below go through `distrobox-enter pkill` so
+# the signal is delivered inside the container namespace.
 distrobox-enter gaming -- "$BIN" "$EBOOT" > "$LOG_PATH" 2>&1 &
 EMULATOR_PID=$!
-echo "   pid:   ${EMULATOR_PID}"
+echo "   pid:   ${EMULATOR_PID} (wrapper)"
 
-# Sleep, then TERM + grace, then KILL. We look for the actual
-# descendant shadps4 process under the distrobox-enter wrapper
-# since the direct pid is the wrapper.
 sleep "$SECONDS_ARG"
 
-# pgrep for the real binary name so we catch the emulator child.
-SHADPS4_PIDS=$(pgrep -f 'shadps4 .*eboot.bin' 2>/dev/null || true)
-if [[ -n "$SHADPS4_PIDS" ]]; then
-  echo "   stopping: $SHADPS4_PIDS"
-  kill -TERM $SHADPS4_PIDS 2>/dev/null || true
-fi
-sleep 5
-SHADPS4_PIDS=$(pgrep -f 'shadps4 .*eboot.bin' 2>/dev/null || true)
-if [[ -n "$SHADPS4_PIDS" ]]; then
-  echo "   kill -9: $SHADPS4_PIDS"
-  kill -9 $SHADPS4_PIDS 2>/dev/null || true
+# Stop: SIGTERM from inside the container (triggers the harness's
+# signal handler → CSV dump → re-raise default). Then poll until
+# the process is actually gone before returning; this is what the
+# previous host-side pgrep flow was missing.
+echo "   stopping via in-container pkill -TERM shadps4"
+distrobox-enter gaming -- pkill -TERM -x shadps4 2>/dev/null || true
+
+# Wait up to GRACE seconds for the emulator to exit cleanly so the
+# CSV write in the signal handler completes.
+GRACE=8
+for ((i=0; i<GRACE; i++)); do
+  if ! distrobox-enter gaming -- pgrep -x shadps4 >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+# If still alive after grace, SIGKILL — but we will have lost the
+# CSV for that cell. The grace window (8s) is generous enough that
+# this should almost never hit on a healthy run; if it does, note
+# it loudly.
+if distrobox-enter gaming -- pgrep -x shadps4 >/dev/null 2>&1; then
+  echo "   kill -9 (harness dump path did not complete in ${GRACE}s)" >&2
+  distrobox-enter gaming -- pkill -KILL -x shadps4 2>/dev/null || true
 fi
 
-# Wait for the wrapper pid to wind up.
+# Clean up the wrapper pid so the shell doesn't accumulate orphans.
 wait "$EMULATOR_PID" 2>/dev/null || true
+
+# Extra safety: if for any reason a stray shadps4 still exists,
+# surface it rather than silently leaking into the next cell.
+if distrobox-enter gaming -- pgrep -x shadps4 >/dev/null 2>&1; then
+  echo "   ERROR: shadps4 still running after cleanup, refusing to continue" >&2
+  distrobox-enter gaming -- pgrep -af shadps4 >&2
+  exit 4
+fi
 
 if [[ -f "$CSV_PATH" ]]; then
   echo "   csv size: $(stat -c %s "$CSV_PATH") bytes"
